@@ -6,12 +6,13 @@ Barras de habitabilidade são fatores de adequação, portanto continuam em porc
 import pygame
 
 FACTOR_LABELS = {
-    'temperatura': 'faixa térmica',
+    'temperatura': 'temp. adequada',
+    'faixa térmica': 'temp. adequada',
     'água líquida': 'água líquida',
-    'pressão': 'pressão útil',
-    'atmosfera': 'atmosfera',
-    'massa': 'massa',
-    'gravidade': 'gravidade',
+    'pressão': 'pressão adequada',
+    'atmosfera': 'atm. adequada',
+    'massa': 'massa adequada',
+    'gravidade': 'gravidade adequada',
     'estrela': 'fluxo estelar',
     'proteção': 'proteção',
     'química': 'química',
@@ -26,8 +27,8 @@ def factor_label(label):
 def draw_factor_bar(screen, font, x, y, width, label, value):
     """Desenha uma barra de fator de habitabilidade.
 
-    Ex.: "faixa térmica: 98%" significa que a temperatura atual está 98% adequada,
-    não que a temperatura seja 98%. A temperatura medida fica no painel em °C.
+    Ex.: "temp. adequada: 98%" significa adequação da temperatura para vida,
+    não uma temperatura percentual. A temperatura real fica no painel em °C.
     """
     value = max(0.0, min(1.0, float(value)))
     if value >= 0.72:

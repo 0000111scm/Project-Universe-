@@ -1,72 +1,35 @@
-# =========================
-# PYTHON
-# =========================
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.so
-
-# Cache / tooling
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.cache/
 
-# =========================
-# AMBIENTES VIRTUAIS
-# =========================
+# Ambientes
 .venv/
 venv/
 env/
 ENV/
 
-# =========================
-# IDE / EDITOR
-# =========================
+# IDE/editor
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# =========================
-# SISTEMA OPERACIONAL
-# =========================
+# Sistema
 .DS_Store
 Thumbs.db
 
-# =========================
-# ARQUIVOS DE EXECUÇÃO / TEMP
-# =========================
-*.log
-*.tmp
-
-# =========================
-# BUILDS / DISTRIBUIÇÃO
-# =========================
-build/
-dist/
-*.egg-info/
-
-# =========================
-# DADOS LOCAIS DO SIMULADOR
-# =========================
+# Saves locais
 universe_save.json
 universe_save_slot*.json
 benchmark_results.json
 
-# =========================
-# FUTURO (RENDER / ASSETS)
-# =========================
-*.mp4
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.avi
-
-# =========================
-# BACKUPS
-# =========================
-*.bak
-*.old
+# Builds/logs
+build/
+dist/
+*.egg-info/
+*.log

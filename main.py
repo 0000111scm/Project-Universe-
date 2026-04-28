@@ -109,6 +109,9 @@ graph_history      = {}   # body_id → {temp:[], vel:[], mass:[]}
 current_slot       = 0
 moving_body        = None
 move_rect          = None
+body_dragging      = False
+body_drag_target   = None
+body_drag_offset   = pygame.Vector2(0, 0)
 
 def get_save_path():
     if current_slot == 0: return SAVE_FILE
@@ -1146,6 +1149,16 @@ def zero_body_velocity(body):
     body.collision_cooldown = 0.8
     return True
 
+
+def move_body_to_world(body, pos):
+    """Reposiciona um corpo com limpeza de rastro e proteção de colisão curta."""
+    if not body or body not in sim.bodies:
+        return False
+    body.pos = pygame.Vector2(pos)
+    body.trail = []
+    body.collision_cooldown = 0.8
+    return True
+
 # ══════════════════════════════════════════
 #  INFO HUD (lado esquerdo)
 # ══════════════════════════════════════════
@@ -1192,16 +1205,16 @@ def draw_body_info():
         (f"  {b.name}",                     (255,215,80),  True),
         (f"Tipo: {bts}",                    (185,185,210), False),
         (f"Massa: {fmt_mass(b.mass)}",      (185,185,195), False),
-        (f"Raio: {fmt_num_br(b.radius,1)} un", (185,185,195), False),
+        (f"Raio visual: {fmt_num_br(b.radius,1)} un", (185,185,195), False),
         (f"Veloc.: {fmt_speed(spd, HAB_SCALE)}", (185,185,195), False),
         (f"Temp.: {fmt_temp_c(temp_k)}",     tc,            False),
         (f"Água: {ws}  {fmt_num_br(wtr*100,0)}%", wc,       False),
-        (f"Atm.: {fmt_num_br(atm,2)} bar",  (140,180,220), False),
+        (f"Atmosfera: {fmt_num_br(atm,2)} bar",  (140,180,220), False),
         (f"Pressão: {fmt_num_br(pressure,2)} bar", (140,180,220), False),
     ]
     if dom_body:
         dist = (b.pos - dom_body.pos).length()
-        lines.append((f"Grav.dom: {dom_body.name[:13]}", (150,170,240), False))
+        lines.append((f"Gravidade dom.: {dom_body.name[:12]}", (150,170,240), False))
         lines.append((f"Dist.: {fmt_distance_au(dist, HAB_SCALE)}", (150,170,240), False))
         lines.append((f"Acel.g: {fmt_acceleration(dom_acc, HAB_SCALE)}", (120,140,210), False))
     if getattr(b, "tidal_heat", 0.0) > 1.0:
@@ -1220,13 +1233,13 @@ def draw_body_info():
         lines.append((f"Roche: {fmt_distance_au(rl,HAB_SCALE)}",(240,85,85),False))
 
     life_color = (70,240,105) if life >= 35 else (220,180,80) if life >= 8 else (120,120,140)
-    lines.append((f"Vida: {fmt_num_br(life,1)}% ({report['class']})", life_color, False))
+    lines.append((f"Vida estimada: {fmt_num_br(life,1)}% ({report['class']})", life_color, False))
     factor_items = list(report.get('factors', {}).items())
     if report.get('reasons'):
-        lines.append(("Obs: " + ", ".join(report['reasons'])[:30], (190,150,90), False))
+        lines.append(("Limites: " + ", ".join(report['reasons'])[:30], (190,150,90), False))
     lines.append((f"Pos: ({int(b.pos.x)}, {int(b.pos.y)})",(110,110,130),False))
 
-    h_box=len(lines)*15+62 + min(6, len(factor_items))*16
+    h_box=len(lines)*15+76 + min(6, len(factor_items))*16
     x0=10; y0_box=HEIGHT-h_box-30
     bg=pygame.Surface((252,h_box+8),pygame.SRCALPHA)
     pygame.draw.rect(bg,(5,8,22,230),(0,0,252,h_box+8),border_radius=10)
@@ -1244,6 +1257,9 @@ def draw_body_info():
         pygame.draw.rect(screen,(55,205,75),(x0,y0-2,int(life/100*110),5),border_radius=2)
 
     y0 += 12
+    if factor_items:
+        screen.blit(font_small.render("Adequação para vida", True, (165, 175, 205)), (x0, y0 - 4))
+        y0 += 14
     for key, val in factor_items[:6]:
         draw_factor_bar(screen, font_small, x0, y0, 135, key, val)
         y0 += 16
@@ -1264,7 +1280,7 @@ def draw_body_info():
     screen.blit(font_small.render("Renomear",True,(210,170,70) if editing_name else (95,95,115)),(x0+85,y0+3))
     pygame.draw.rect(screen,(18,44,46) if moving_body is b else (14,14,28),mr,border_radius=4)
     pygame.draw.rect(screen,(60,185,190) if moving_body is b else (36,36,60),mr,1,border_radius=4)
-    screen.blit(font_small.render("Mover",True,(90,220,220) if moving_body is b else (95,95,115)),(mr.x+8,y0+3))
+    screen.blit(font_small.render("Setas",True,(90,220,220) if moving_body is b else (95,95,115)),(mr.x+8,y0+3))
     pygame.draw.rect(screen,(42,20,20),zv,border_radius=4)
     pygame.draw.rect(screen,(145,70,70),zv,1,border_radius=4)
     screen.blit(font_small.render("Zerar V",True,(225,145,145)),(zv.x+5,zv.y+3))
@@ -1430,7 +1446,8 @@ while running:
                     selected_body=None
                     followed_body=None
                     moving_body=None
-            # Setas: movem o corpo selecionado quando o modo Mover está ativo.
+                    body_dragging=False
+            # Setas: movem o corpo selecionado quando o modo Setas está ativo.
             # Fora dele, setas navegam pela câmera na direção intuitiva.
             if event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
                 step = (90.0 if (pygame.key.get_mods() & pygame.KMOD_SHIFT) else 25.0) / zoom
@@ -1460,6 +1477,10 @@ while running:
                     graph_history.pop(id(selected_body), None)
                     sim.bodies.remove(selected_body)
                     if followed_body == selected_body: followed_body = None
+                    if moving_body == selected_body: moving_body = None
+                    if body_drag_target == selected_body:
+                        body_drag_target = None
+                        body_dragging = False
                     selected_body = None
 
             if event.key == pygame.K_d and pygame.key.get_mods() & pygame.KMOD_CTRL:
@@ -1571,7 +1592,7 @@ while running:
                         entry=get_catalog_entry(key)
                         if entry and entry.get("preset"):
                             if apply_preset(sim, entry["preset"]):
-                                selected_type=None; selected_body=None; followed_body=None; moving_body=None
+                                selected_type=None; selected_body=None; followed_body=None; moving_body=None; body_dragging=False; body_drag_target=None
                                 body_ages.clear(); flare_timers.clear(); graph_history.clear(); orbit_cache.clear(); preview_trail=[]
                                 planet_count=len(sim.bodies)
                                 paused=False
@@ -1618,19 +1639,22 @@ while running:
                             globals()["graph_mode"]=gm; break
 
                 elif event.button==1:
-                    if moving_body and moving_body in sim.bodies:
-                        new_pos = screen_to_world(mx, my, camera_offset, zoom, cx, cy)
-                        moving_body.pos = pygame.Vector2(new_pos)
-                        moving_body.trail = []
-                        moving_body.collision_cooldown = 0.8
-                        selected_body = moving_body
+                    hit = get_body_at(mx,my)
+                    if hit and hit is selected_body and get_catalog_entry(selected_type) is None:
+                        # Clique e segure no corpo já selecionado: arrasta apenas enquanto o botão estiver pressionado.
+                        body_drag_target = hit
+                        body_dragging = True
+                        followed_body = None
+                        paused = True
+                        world_pos = screen_to_world(mx, my, camera_offset, zoom, cx, cy)
+                        body_drag_offset = hit.pos - world_pos
+                        hit.collision_cooldown = 0.8
                     elif get_catalog_entry(selected_type) is not None and sim.can_add_body():
                         placing=True
                         place_start_screen=pygame.Vector2(mx,my)
                         place_pos_world=screen_to_world(mx,my,camera_offset,zoom,cx,cy)
                         preview_trail=[]
                     else:
-                        hit=get_body_at(mx,my)
                         if hit and hit==last_click_body and (now-last_click_time)<400:
                             followed_body=hit
                         else:
@@ -1646,6 +1670,10 @@ while running:
                         graph_history.pop(id(hit),None)
                         sim.bodies.remove(hit)
                         if selected_body==hit: selected_body=None
+                        if moving_body==hit: moving_body=None
+                        if body_drag_target==hit:
+                            body_drag_target=None
+                            body_dragging=False
                         if terraforming_body==hit: terraforming_body=None
                     else:
                         dragging=True; drag_start=pygame.Vector2(mx,my)
@@ -1653,6 +1681,9 @@ while running:
         if event.type==pygame.MOUSEBUTTONUP:
             if event.button==1:
                 if dragging_slider: dragging_slider=None
+                body_dragging = False
+                body_drag_target = None
+                body_drag_offset = pygame.Vector2(0, 0)
                 if placing:
                     placing=False; mx,my=pygame.mouse.get_pos()
                     if get_catalog_entry(selected_type) is not None and place_pos_world is not None:
@@ -1686,12 +1717,14 @@ while running:
                 if dragging_slider=="mass":  slider_mass_mult=nv
                 elif dragging_slider=="rad": slider_rad_mult=nv
                 elif dragging_slider=="vel": slider_vel_mult=nv
-            if moving_body and moving_body in sim.bodies and mx < SIM_W and pygame.mouse.get_pressed()[0]:
-                new_pos = screen_to_world(mx, my, camera_offset, zoom, cx, cy)
-                moving_body.pos = pygame.Vector2(new_pos)
-                moving_body.trail = []
-                moving_body.collision_cooldown = 0.8
-                selected_body = moving_body
+            if body_dragging and body_drag_target and body_drag_target in sim.bodies and mx < SIM_W and pygame.mouse.get_pressed()[0]:
+                new_pos = screen_to_world(mx, my, camera_offset, zoom, cx, cy) + body_drag_offset
+                move_body_to_world(body_drag_target, new_pos)
+                selected_body = body_drag_target
+            elif body_dragging and not pygame.mouse.get_pressed()[0]:
+                body_dragging = False
+                body_drag_target = None
+                body_drag_offset = pygame.Vector2(0, 0)
             if dragging and not dragging_slider:
                 mp=pygame.Vector2(mx,my)
                 delta=(mp-drag_start)/zoom
@@ -1868,8 +1901,10 @@ while running:
 
     # Status discreto, sem poluir com lista de atalhos.
     status = f"Corpos: {len(sim.bodies)} | Tempo: {'pausado' if paused else str(sim.time_scale)+'x'}"
-    if moving_body and moving_body in sim.bodies:
-        status += f" | Movendo: {moving_body.name} | setas movem | Shift+setas rápido"
+    if body_dragging and body_drag_target and body_drag_target in sim.bodies:
+        status += f" | Arrastando: {body_drag_target.name}"
+    elif moving_body and moving_body in sim.bodies:
+        status += f" | Modo setas: {moving_body.name} | Shift+setas rápido"
     screen.blit(font_small.render(status, True, (55,55,80)), (10, HEIGHT-12))
 
     draw_panel()
