@@ -4,8 +4,8 @@ WIDTH, HEIGHT = 1280, 800
 PANEL_W = 280
 SIM_W = WIDTH - PANEL_W
 FPS = 60
-G = 200
-M_SOL = 1e6
+G = 0.6006  # escala corrigida: preserva velocidades orbitais com M_SOL realista
+M_SOL = 3.33e8  # Terra=1e3; Sol≈333000 Terras
 HAB_SCALE = 150.0  # px ≈ 1 UA
 
 BG_W = SIM_W * 3

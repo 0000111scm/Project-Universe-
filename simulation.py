@@ -1,15 +1,19 @@
 import pygame, math, random, colorsys
+try:
+    import numpy as np
+except Exception:
+    np = None
 from body import Body
 from physics.impact_solver import ImpactInput, ImpactType, solve_impact
 from physics.material_model import infer_material, material_pair_response, mixed_strength
 from physics.angular_momentum import directional_ejecta_vector, merged_angular_velocity, spin_kick_from_impact
 from physics.structural_damage import apply_structural_damage, ensure_structure, relax_structure
+from physics.local_physics import ensure_internal_layers, deposit_impact_energy, relax_internal_layers
 
-G                    = 200
+G                    = 0.6006
 MASS_PLANET          = 5e2
-MASS_STAR            = 8e5
-MASS_BLACK_HOLE      = 5e6
-
+MASS_STAR            = 5e7
+MASS_BLACK_HOLE      = 1e9
 # Ajustes do modelo de colisao intermediario.
 # Nao e SPH ainda; e um degrau pragmatico entre "fundir tudo" e hidrodinamica real.
 MERGE_SPEED          = 80.0
@@ -263,27 +267,35 @@ def _apply_impact_side_effects(target, projectile, energy, rel_speed, absorbed_m
 
 
 def _apply_energy_temperature(body, heat_energy, affected_mass=None):
-    """Converte energia térmica em aumento de temperatura aproximado.
+    """Converte energia térmica em aquecimento local.
 
-    Usa capacidade térmica efetiva por material. Isso evita cor fake substituir física.
+    PATCH 55:
+    - corpos sólidos aquecem crosta/superfície primeiro;
+    - estrelas/plasma aquecem envelope;
+    - body.temperature representa a camada externa, não o corpo inteiro.
     """
-    material = getattr(body, "material", "rock")
-    heat_capacity = {
-        "ice": 2100.0,
-        "rock": 900.0,
-        "metal": 520.0,
-        "gas": 14000.0,
-        "plasma": 22000.0,
-        "blackhole": 1.0e30,
-    }.get(material, 900.0)
+    if heat_energy <= 0:
+        return 0.0
 
-    mass = max(affected_mass if affected_mass is not None else getattr(body, "mass", 1.0), 1e-9)
-    delta_t = heat_energy / max(mass * heat_capacity, 1e-9)
+    try:
+        ensure_internal_layers(body)
+        return deposit_impact_energy(body, heat_energy, affected_mass=affected_mass, depth="surface")
+    except Exception:
+        material = getattr(body, "material", "rock")
+        heat_capacity = {
+            "ice": 2100.0,
+            "rock": 900.0,
+            "metal": 520.0,
+            "gas": 14000.0,
+            "plasma": 22000.0,
+            "blackhole": 1.0e30,
+        }.get(material, 900.0)
 
-    # Escala do protótipo: limita salto para não quebrar UI/cores.
-    delta_t = _clamp(delta_t, 0.0, 25000.0)
-    body.temperature = max(getattr(body, "temperature", 300.0), getattr(body, "temperature", 300.0) + delta_t)
-    return delta_t
+        mass = max(affected_mass if affected_mass is not None else getattr(body, "mass", 1.0), 1e-9)
+        delta_t = heat_energy / max(mass * heat_capacity, 1e-9)
+        delta_t = _clamp(delta_t, 0.0, 25000.0)
+        body.temperature = max(getattr(body, "temperature", 300.0), getattr(body, "temperature", 300.0) + delta_t)
+        return delta_t
 
 
 def _inherit_fragment_surface(fragment, source, thermal_energy_scale):
@@ -335,6 +347,40 @@ def _limit_giant_velocity(body):
     if _is_gas_giant(body) and body.vel.length() > max_speed:
         body.vel.scale_to_length(max_speed)
 
+def _is_star_like(body):
+    return getattr(body, "mass", 0.0) >= MASS_STAR or getattr(body, "material", "") == "plasma"
+
+
+def _can_inherit_rings(target, donor):
+    # Estrela/plasma/buraco negro nunca herda anel de planeta.
+    if _is_star_like(target) or getattr(target, "material", "") == "blackhole":
+        return False
+    if getattr(donor, "mass", 0.0) >= MASS_STAR:
+        return False
+    return bool(getattr(target, "has_rings", False) or getattr(donor, "has_rings", False))
+
+
+def _contact_key(a, b):
+    return tuple(sorted((id(a), id(b))))
+
+
+
+def _cap_vector(vec, max_len):
+    if vec.length() > max_len:
+        vec = pygame.Vector2(vec)
+        vec.scale_to_length(max_len)
+    return vec
+
+
+def _body_can_fragment(body):
+    if _is_star_like(body):
+        return False
+    if getattr(body, "material", "") in ("plasma", "blackhole"):
+        return False
+    return True
+
+
+
 
 class CollisionEvent:
     def __init__(self, pos, kind):
@@ -351,6 +397,8 @@ class Simulation:
         self.collision_events = []
         self.max_bodies       = MAX_BODIES
         self.performance_mode = False
+        self.stellar_contacts  = {}
+        self.use_numpy_gravity = True
 
     def _trim_for_new_body(self, reserve=1):
         """Remove detritos primeiro para abrir espaco para astros criados pelo usuario."""
@@ -372,26 +420,12 @@ class Simulation:
         if not self._trim_for_new_body(1):
             return False
         ensure_structure(body)
+        ensure_internal_layers(body)
         self.bodies.append(body)
         return True
 
     def _compute_accelerations(self):
-        for b in self.bodies:
-            b.acc = pygame.Vector2(0.0, 0.0)
-        n = len(self.bodies)
-        for i in range(n):
-            a = self.bodies[i]
-            for j in range(i + 1, n):
-                b = self.bodies[j]
-                dx = b.pos.x - a.pos.x
-                dy = b.pos.y - a.pos.y
-                ds2 = dx*dx + dy*dy + 25.0
-                ds  = math.sqrt(ds2)
-                f   = G * a.mass * b.mass / ds2
-                fx  = f * dx / ds
-                fy  = f * dy / ds
-                a.acc.x += fx / a.mass; a.acc.y += fy / a.mass
-                b.acc.x -= fx / b.mass; b.acc.y -= fy / b.mass
+        self._compute_accelerations_for(self.bodies)
 
     def _separate(self, a, b):
         d = b.pos - a.pos
@@ -448,8 +482,6 @@ class Simulation:
         # Plasma não recebe cratera. Impacto vira acreção/fusão/disrupção térmica.
         if a.mass >= MASS_STAR or b.mass >= MASS_STAR:
             if a.mass >= MASS_STAR and b.mass >= MASS_STAR:
-                if impact.impact_type in (ImpactType.CATASTROPHIC_DISRUPTION, ImpactType.VAPORIZATION):
-                    return "stellar_disruption"
                 return "stellar_merge"
             return "plasma_accretion"
 
@@ -556,19 +588,143 @@ class Simulation:
         a.mass = total_mass
         a.radius = new_radius
         a.color = _thermal_tint(new_color, impact_energy / max(total_mass, 1e-9), getattr(a, "material", "rock"))
-        a.has_rings = getattr(a, "has_rings", False) or getattr(b, "has_rings", False)
+        a.has_rings = _can_inherit_rings(a, b)
         a.name = new_name
         a.trail = []
         a.collision_cooldown = COLLISION_COOLDOWN
         self._copy_surface_properties(a, a, b, old_a_mass, old_b_mass)
         a.material = infer_material(a)
+        if _is_star_like(a):
+            a.has_rings = False
         a.angular_velocity = new_omega
         _apply_impact_side_effects(a, b, impact_energy, rel_speed, old_b_mass)
         _apply_energy_temperature(a, impact_energy * 0.25, affected_mass=max(total_mass, 1e-9))
         apply_structural_damage(a, impact=None, heat_energy=impact_energy * 0.25, affected_mass=max(total_mass, 1e-9), strength=1.0e5)
         self.collision_events.append(CollisionEvent(new_pos, kind))
 
+    def _stellar_contact_collision(self, a, b, impact, dt_contact=0.25):
+        """Contato estrela-estrela com envelope comum.
+
+        Sem quique, sem atravessar infinito, sem fusão instantânea no primeiro frame.
+        O par perde velocidade relativa e funde após contato persistente/overlap profundo.
+        """
+        key = _contact_key(a, b)
+        dist = max((a.pos - b.pos).length(), 1e-6)
+        overlap = (a.radius + b.radius) - dist
+        overlap_ratio = _clamp(overlap / max(min(a.radius, b.radius), 1.0), 0.0, 3.0)
+
+        state = self.stellar_contacts.get(key, {"time": 0.0, "energy": 0.0})
+        state["time"] += dt_contact
+        state["energy"] += getattr(impact, "impact_energy", 0.0)
+        self.stellar_contacts[key] = state
+
+        total_mass = max(a.mass + b.mass, 1e-9)
+        bary_pos = (a.pos * a.mass + b.pos * b.mass) / total_mass
+        bary_vel = (a.vel * a.mass + b.vel * b.mass) / total_mass
+
+        # Plasma não ricocheteia. Remove energia cinética relativa.
+        rel_speed_before = (a.vel - b.vel).length()
+        damping = _clamp(0.35 + overlap_ratio * 0.25, 0.35, 0.85)
+        a.vel = a.vel.lerp(bary_vel, damping)
+        b.vel = b.vel.lerp(bary_vel, damping)
+
+        # Envelope comum: aproxima centros do baricentro, sem empurrão de repulsão.
+        pull = _clamp(0.08 + overlap_ratio * 0.10, 0.08, 0.28)
+        a.pos = a.pos.lerp(bary_pos, pull * (b.mass / total_mass))
+        b.pos = b.pos.lerp(bary_pos, pull * (a.mass / total_mass))
+
+        heat = getattr(impact.energy, "heat", 0.0)
+        _apply_energy_temperature(a, heat * (a.mass / total_mass), affected_mass=max(a.mass * 0.12, 1.0))
+        _apply_energy_temperature(b, heat * (b.mass / total_mass), affected_mass=max(b.mass * 0.12, 1.0))
+
+        a.material = "plasma"
+        b.material = "plasma"
+        a.has_rings = False
+        b.has_rings = False
+        a.stellar_activity = max(getattr(a, "stellar_activity", 0.0), 0.55)
+        b.stellar_activity = max(getattr(b, "stellar_activity", 0.0), 0.55)
+
+        # Não bloqueia o próximo frame de contato.
+        a.collision_cooldown = 0.0
+        b.collision_cooldown = 0.0
+
+        rel_speed_after = (a.vel - b.vel).length()
+        merge_now = (
+            overlap_ratio >= 0.35
+            or state["time"] >= 0.35
+            or rel_speed_after < max(80.0, rel_speed_before * 0.35)
+        )
+
+        if merge_now:
+            self._merge_stars_progressive(a, b, state)
+            self.stellar_contacts.pop(key, None)
+            return "merged"
+
+        self.collision_events.append(CollisionEvent(bary_pos, "stellar_contact"))
+        return "contact"
+
+    def _merge_stars_progressive(self, a, b, state):
+        total_mass = max(a.mass + b.mass, 1e-9)
+        new_pos = (a.pos * a.mass + b.pos * b.mass) / total_mass
+        new_vel = (a.vel * a.mass + b.vel * b.mass) / total_mass
+        new_radius = _volume_radius(a.radius, b.radius)
+
+        old_a_mass, old_b_mass = a.mass, b.mass
+        a.pos = new_pos
+        a.vel = new_vel
+        a.mass = total_mass
+        a.radius = new_radius
+        a.material = "plasma"
+        a.has_rings = False
+        a.name = "Estrela Fundida"
+        a.trail = []
+        a.collision_cooldown = COLLISION_COOLDOWN * 1.2
+        self._copy_surface_properties(a, a, b, old_a_mass, old_b_mass)
+        a.material = "plasma"
+        a.has_rings = False
+        a.stellar_activity = 1.0
+        _apply_energy_temperature(a, state.get("energy", 0.0) * 0.25, affected_mass=max(total_mass * 0.15, 1.0))
+        self.collision_events.append(CollisionEvent(new_pos, "stellar_merge"))
+
+    def _stellar_accretion(self, star, body):
+        """Acreção estrela + corpo menor.
+
+        Sem anel, sem fragmentação sólida orbital e sem flash global.
+        Conserva momento com massa absorvida e converte impacto em aquecimento/atividade.
+        """
+        energy, rel_speed, _mu = _impact_energy(star, body)
+
+        retained = 0.995
+        absorbed_mass = body.mass * retained
+        total_mass = star.mass + absorbed_mass
+
+        star.pos = (star.pos * star.mass + body.pos * absorbed_mass) / total_mass
+        star.vel = (star.vel * star.mass + body.vel * absorbed_mass) / total_mass
+        star.mass = total_mass
+
+        # Estrela cresce pouco visualmente no protótipo.
+        star.radius = max(star.radius, _volume_radius(star.radius, body.radius * 0.20))
+        star.has_rings = False
+        star.material = "plasma"
+        star.trail = []
+        star.collision_cooldown = COLLISION_COOLDOWN
+
+        _apply_impact_side_effects(star, body, energy, rel_speed, absorbed_mass)
+        _apply_energy_temperature(star, energy * 0.35, affected_mass=max(absorbed_mass, MIN_FRAGMENT_MASS))
+
+        activity = min(1.0, 0.08 + body.mass / max(star.mass, 1e-9) * 120.0)
+        star.stellar_activity = max(getattr(star, "stellar_activity", 0.0), activity)
+        star.impact_flash = max(getattr(star, "impact_flash", 0.0), activity * 0.25)
+
+        # Planeta não "some": vira energia/plasma/acréscimo estelar no evento.
+        self.collision_events.append(CollisionEvent(body.pos, "stellar_accretion"))
+        self.collision_events.append(CollisionEvent(star.pos, "plasma_flare"))
+
     def _absorb_body(self, big, small):
+        if _is_star_like(big) and not _is_star_like(small):
+            self._stellar_accretion(big, small)
+            return
+
         energy, rel_speed, _mu = _impact_energy(big, small)
         angle = _impact_angle(big, small)
         mass_ratio = small.mass / max(big.mass, 1e-9)
@@ -602,7 +758,7 @@ class Simulation:
             energy_scale,
             getattr(big, "material", "rock"),
         )
-        big.has_rings = getattr(big, "has_rings", False) or getattr(small, "has_rings", False)
+        big.has_rings = _can_inherit_rings(big, small)
         big.name = big.name or classify_body(big.mass)
         big.trail = []
         big.collision_cooldown = COLLISION_COOLDOWN
@@ -617,38 +773,61 @@ class Simulation:
         self.collision_events.append(CollisionEvent(new_pos, "impact"))
 
     def _spawn_fragments(self, source, collider, ejecta_mass, kind, count_hint=None, impact=None):
-        """Fragmentação direcional com conservação aproximada de massa e energia."""
+        """PATCH 56 — fragmentação mais conservativa.
+
+        Regras:
+        - estrelas/plasma não viram pedras;
+        - massa e momento são tratados de forma aproximada;
+        - detritos saem em cone coerente com o impacto;
+        - recoil no corpo fonte compensa momentum dos fragmentos;
+        - ejeção é limitada para evitar explosões numéricas.
+        """
         if ejecta_mass < MIN_FRAGMENT_MASS:
+            return
+        if not _body_can_fragment(source):
             return
 
         rel = source.vel - collider.vel
-        rel_speed = max(rel.length(), 20.0)
+        rel_speed = max(rel.length(), 10.0)
 
         if impact is not None:
             energy_budget = max(
-                getattr(impact.energy, "fragmentation", 0.0) +
-                getattr(impact.energy, "ejecta", 0.0),
-                0.0
+                getattr(impact.energy, "fragmentation", 0.0)
+                + getattr(impact.energy, "ejecta", 0.0),
+                0.0,
             )
-            count = count_hint or int(_clamp(ejecta_mass / max(source.mass * 0.04, 2.0), 2, MAX_FRAGMENTS))
             away = directional_ejecta_vector(source, collider, impact)
+            graze = _clamp(
+                getattr(impact, "tangential_velocity", 0.0)
+                / max(getattr(impact, "relative_velocity", 1e-9), 1e-9),
+                0.0,
+                1.0,
+            )
         else:
             energy_budget = 0.5 * max(ejecta_mass, MIN_FRAGMENT_MASS) * rel_speed * rel_speed
-            count = count_hint or int(_clamp(ejecta_mass / 8.0, 2, MAX_FRAGMENTS))
             away = source.pos - collider.pos
             if away.length_squared() == 0:
                 away = pygame.Vector2(random.uniform(-1, 1), random.uniform(-1, 1))
             if away.length_squared() == 0:
                 away = pygame.Vector2(1, 0)
             away = away.normalize()
+            graze = _impact_angle(source, collider)
 
-        count = int(_clamp(count, 1, MAX_FRAGMENTS))
+        # Quantidade limitada e proporcional à massa e severidade.
+        severity = _clamp(energy_budget / max(ejecta_mass * 1.0e5, 1e-9), 0.0, 1.0)
+        base_count = count_hint or int(_clamp(2 + severity * 6 + graze * 3, 2, MAX_FRAGMENTS))
+        count = int(_clamp(base_count, 1, MAX_FRAGMENTS))
+
         if getattr(self, "performance_mode", False) or len(self.bodies) > 120:
             count = min(count, 4)
 
         available_slots = max(0, getattr(self, "max_bodies", MAX_BODIES) - len(self.bodies))
         count = min(count, available_slots)
         if count <= 0:
+            return
+
+        ejecta_mass = min(ejecta_mass, max(source.mass - MIN_FRAGMENT_MASS, 0.0))
+        if ejecta_mass < MIN_FRAGMENT_MASS:
             return
 
         fragment_mass = ejecta_mass / count
@@ -658,37 +837,67 @@ class Simulation:
 
         specific_fragment_energy = energy_budget / max(ejecta_mass, 1e-9)
         eject_speed_base = math.sqrt(max(0.0, 2.0 * specific_fragment_energy))
-        eject_speed_base = _clamp(eject_speed_base, 15.0, max(60.0, rel_speed * 1.35))
+        eject_speed_base = _clamp(eject_speed_base, 3.0, max(18.0, rel_speed * 0.38))
 
-        # Base comum mantém conservação de momento visualmente plausível.
-        center_velocity = (source.vel * source.mass + collider.vel * collider.mass) / max(source.mass + collider.mass, 1e-9)
+        center_velocity = (
+            source.vel * source.mass + collider.vel * collider.mass
+        ) / max(source.mass + collider.mass, 1e-9)
+
+        total_fragment_momentum = pygame.Vector2(0.0, 0.0)
+        created_mass = 0.0
+        source_vel_before = pygame.Vector2(source.vel)
+
+        # Cone: frontal = mais aberto; rasante = cauda estreita.
+        cone = 0.55 - 0.32 * graze
+        cone = _clamp(cone, 0.16, 0.58)
 
         for idx in range(count):
-            # Distribuição em cone, não explosão circular.
-            spread = 0.28 if impact is not None else 0.55
-            angle = random.uniform(-spread, spread)
+            # Distribuição determinística+ruído baixo: evita explosão circular randômica.
+            t = 0.0 if count == 1 else (idx / (count - 1) - 0.5)
+            angle = t * cone + random.uniform(-cone * 0.18, cone * 0.18)
             direction = away.rotate_rad(angle)
-            speed = random.uniform(0.55, 1.05) * eject_speed_base
+            speed = eject_speed_base * random.uniform(0.55, 0.95)
 
-            pos = source.pos + direction * random.uniform(source.radius * 0.35, source.radius + 3)
+            pos = source.pos + direction * random.uniform(source.radius * 0.35, source.radius + 2.0)
             vel = center_velocity + direction * speed
-            radius = max(1.0, source.radius * ((fragment_mass / max(source.mass, 1e-9)) ** (1.0/3.0)))
+            radius = max(1.0, source.radius * ((fragment_mass / max(source.mass, 1e-9)) ** (1.0 / 3.0)))
 
-            frag = Body(pos.x, pos.y, vel.x, vel.y, fragment_mass, radius, getattr(source, "base_color", source.color), "Fragmento")
+            frag = Body(
+                pos.x,
+                pos.y,
+                vel.x,
+                vel.y,
+                fragment_mass,
+                radius,
+                getattr(source, "base_color", source.color),
+                "Fragmento",
+            )
             _inherit_fragment_surface(frag, source, specific_fragment_energy)
 
             frag.is_fragment = True
             frag.show_label = False
             frag.has_rings = False
             frag.spin = random.uniform(0, math.tau)
-            frag.angular_velocity = random.uniform(-1.0, 1.0) + (speed / max(radius, 1.0)) * random.uniform(-0.18, 0.18)
+            frag.angular_velocity = random.uniform(-0.45, 0.45)
             frag.label_timer = FRAGMENT_LABEL_TIME
             frag.temperature = max(getattr(source, "temperature", 300.0), 300.0)
             _apply_energy_temperature(frag, energy_budget / max(count, 1), affected_mass=fragment_mass)
             frag.age = 0.0
-            frag.life_timer = FRAGMENT_LIFETIME * random.uniform(0.65, 1.25)
-            frag.collision_cooldown = COLLISION_COOLDOWN * 1.4
+            frag.life_timer = FRAGMENT_LIFETIME * random.uniform(0.85, 1.35)
+            frag.collision_cooldown = COLLISION_COOLDOWN * 1.6
+
             self.bodies.append(frag)
+
+            total_fragment_momentum += frag.vel * frag.mass
+            created_mass += frag.mass
+
+        # Recoil conservativo aproximado.
+        if source in self.bodies and source.mass > MIN_FRAGMENT_MASS and created_mass > 0:
+            expected_fragment_momentum = source_vel_before * created_mass
+            excess = total_fragment_momentum - expected_fragment_momentum
+            recoil = excess / max(source.mass, 1e-9)
+            recoil = _cap_vector(recoil, max(2.0, rel_speed * 0.18))
+            source.vel -= recoil
 
         self.collision_events.append(CollisionEvent(source.pos, kind))
 
@@ -702,11 +911,11 @@ class Simulation:
 
         # Raspante: arranca material, preserva parte do projétil e adiciona rotação.
         scrape_boost = 0.45 + angle * 0.55
-        small_ejecta = small.mass * (0.35 + min(0.45, energy_scale / 90000.0)) * scrape_boost
-        small_ejecta = min(small.mass * 0.90, small_ejecta)
+        small_ejecta = small.mass * (0.22 + min(0.32, energy_scale / 140000.0)) * scrape_boost
+        small_ejecta = min(small.mass * 0.72, small_ejecta)
         small_absorbed = small.mass - small_ejecta
 
-        damage = min(0.22 if destructive else 0.10, (energy_scale / 250000.0) * (1.0 + angle))
+        damage = min(0.14 if destructive else 0.065, (energy_scale / 380000.0) * (1.0 + angle))
         big_ejecta = big.mass * damage
 
         old_big_mass = big.mass
@@ -718,7 +927,7 @@ class Simulation:
             energy_scale,
             getattr(big, "material", "rock"),
         )
-        big.has_rings = getattr(big, "has_rings", False) or getattr(small, "has_rings", False)
+        big.has_rings = _can_inherit_rings(big, small)
         big.name = big.name or classify_body(big.mass)
         big.trail = []
         big.collision_cooldown = COLLISION_COOLDOWN
@@ -748,7 +957,49 @@ class Simulation:
         self.collision_events.append(CollisionEvent((a.pos + b.pos) * 0.5, "scrape" if angle > 0.55 else "impact"))
         return big, small
 
+    def _planetary_contact_collision(self, a, b, impact):
+        """Colisão planeta-planeta inelástica.
+
+        Evita comportamento de bola de bilhar. Impacto planetário deve dissipar,
+        danificar, aquecer e ejetar massa quando houver energia suficiente.
+        """
+        big, small = (a, b) if a.mass >= b.mass else (b, a)
+
+        rel_ratio = impact.normal_velocity / max(impact.relative_velocity, 1e-9)
+
+        # Impacto frontal/forte: dano/cratera/fragmentação.
+        if rel_ratio > 0.35 or impact.specific_energy > impact.disruption_threshold * 0.08:
+            return self._fragment_collision(a, b, destructive=False, impact=impact)
+
+        # Raspão real: separa com restituição baixa.
+        normal = b.pos - a.pos
+        if normal.length_squared() == 0:
+            normal = pygame.Vector2(1, 0)
+        n = normal.normalize()
+        rel_vel = b.vel - a.vel
+        closing_speed = rel_vel.dot(n)
+
+        if closing_speed < 0:
+            restitution = 0.04
+            impulse_mag = -(1.0 + restitution) * closing_speed / max((1.0 / a.mass) + (1.0 / b.mass), 1e-9)
+            impulse = n * impulse_mag
+            a.vel -= impulse / a.mass
+            b.vel += impulse / b.mass
+
+        _register_impact_mark(big, small.pos, impact.impact_energy, impact.tangential_velocity / max(impact.relative_velocity, 1e-9), getattr(small, "material", "rock"))
+        _apply_energy_temperature(big, getattr(impact.energy, "heat", 0.0) * 0.35, affected_mass=max(small.mass, big.mass * 0.05))
+        apply_structural_damage(big, impact=impact, heat_energy=getattr(impact.energy, "heat", 0.0) * 0.35, affected_mass=max(small.mass, big.mass * 0.05), strength=getattr(impact, "disruption_threshold", 1.0e5))
+
+        a.collision_cooldown = COLLISION_COOLDOWN * 1.4
+        b.collision_cooldown = COLLISION_COOLDOWN * 1.4
+        self._separate(a, b)
+        self.collision_events.append(CollisionEvent((a.pos + b.pos) * 0.5, "planetary_scrape"))
+        return None
+
     def _hit_and_run_collision(self, a, b, impact):
+        if a.mass >= MASS_PLANET and b.mass >= MASS_PLANET and not (_is_star_like(a) or _is_star_like(b)):
+            return self._planetary_contact_collision(a, b, impact)
+
         # Colisão tangencial: não funde, não apaga o projétil.
         # Separa os corpos e aplica impulso normal simples com conservação de momento.
         normal = b.pos - a.pos
@@ -760,7 +1011,7 @@ class Simulation:
 
         rel_vel = b.vel - a.vel
         closing_speed = rel_vel.dot(n)
-        restitution = 0.35 if impact.specific_energy < impact.disruption_threshold else 0.12
+        restitution = 0.02 if impact.specific_energy < impact.disruption_threshold else 0.005
 
         if closing_speed < 0:
             impulse_mag = -(1.0 + restitution) * closing_speed / max((1.0 / a.mass) + (1.0 / b.mass), 1e-9)
@@ -799,7 +1050,8 @@ class Simulation:
             j = i + 1
             while j < n:
                 a, b = self.bodies[i], self.bodies[j]
-                if getattr(a, "collision_cooldown", 0.0) > 0 or getattr(b, "collision_cooldown", 0.0) > 0:
+                star_pair = _is_star_like(a) and _is_star_like(b)
+                if not star_pair and (getattr(a, "collision_cooldown", 0.0) > 0 or getattr(b, "collision_cooldown", 0.0) > 0):
                     j += 1
                     continue
 
@@ -821,12 +1073,18 @@ class Simulation:
                         j += 1
                         continue
                     elif kind in ("stellar_merge", "stellar_disruption"):
-                        self._merge_bodies(a, b, "stellar")
-                        self.bodies.pop(j)
-                        n -= 1
+                        result = self._stellar_contact_collision(a, b, impact)
+                        if result == "merged":
+                            self.bodies.pop(j)
+                            n -= 1
+                            continue
+                        j += 1
                         continue
                     elif kind in ("accretion", "galactic_accretion", "plasma_accretion", "absorb"):
-                        big, small = (a, b) if a.mass >= b.mass else (b, a)
+                        if kind == "plasma_accretion":
+                            big, small = (a, b) if _is_star_like(a) else (b, a)
+                        else:
+                            big, small = (a, b) if a.mass >= b.mass else (b, a)
                         self._absorb_body(big, small)
                         self.bodies.remove(small)
                         n -= 1
@@ -860,29 +1118,162 @@ class Simulation:
             i += 1
 
     def check_roche(self):
-        pass
+        """Roche conservador.
+
+        Hotfix: não despedaça sistema inicial.
+        Só atua quando há aproximação realmente extrema e corpo já existe há tempo mínimo.
+        """
+        if len(self.bodies) < 2:
+            return
+
+        events = 0
+        for body in self.bodies[:]:
+            if getattr(body, "is_fragment", False):
+                continue
+            if getattr(body, "age", 0.0) < 1.5:
+                continue
+            if body.mass <= MIN_FRAGMENT_MASS * 20:
+                continue
+            if _is_star_like(body) or getattr(body, "material", "") in ("plasma", "blackhole"):
+                continue
+
+            primary = None
+            best = 0.0
+            for other in self.bodies:
+                if other is body:
+                    continue
+                if other.mass <= body.mass * 5.0:
+                    continue
+                if getattr(other, "is_fragment", False):
+                    continue
+
+                d2 = max((body.pos - other.pos).length_squared(), 1e-6)
+                influence = other.mass / d2
+                if influence > best:
+                    best = influence
+                    primary = other
+
+            if primary is None:
+                body.roche_stress = max(0.0, getattr(body, "roche_stress", 0.0) * 0.96)
+                continue
+
+            dist = max((body.pos - primary.pos).length(), 1.0)
+
+            # Só começa perto mesmo. Evita destruir planetas em órbita normal.
+            contact_safe = primary.radius + body.radius * 2.4
+            if dist > contact_safe:
+                body.roche_stress = max(0.0, getattr(body, "roche_stress", 0.0) * 0.96)
+                continue
+
+            stress = _clamp((contact_safe - dist) / max(contact_safe, 1e-9), 0.0, 1.0)
+            body.roche_stress = max(getattr(body, "roche_stress", 0.0) * 0.90, stress)
+
+            if stress <= 0.18 or events >= 2:
+                continue
+
+            apply_structural_damage(
+                body,
+                impact=None,
+                heat_energy=body.mass * stress * 80.0,
+                affected_mass=max(body.mass * 0.03, MIN_FRAGMENT_MASS),
+                strength=max(self._body_strength(body), 1.0),
+            )
+
+            if stress > 0.42 and len(self.bodies) < self.max_bodies - 2:
+                shed_fraction = _clamp(stress * 0.015, 0.003, 0.035)
+                shed_mass = min(body.mass - MIN_FRAGMENT_MASS, body.mass * shed_fraction)
+                if shed_mass >= MIN_FRAGMENT_MASS:
+                    body.mass -= shed_mass
+                    body.radius = max(1.0, body.radius * ((body.mass / max(body.mass + shed_mass, 1e-9)) ** (1.0/3.0)))
+                    self._spawn_fragments(body, primary, shed_mass, "roche", count_hint=1)
+                    events += 1
+
+    def _compute_accelerations_for(self, bodies):
+        """Calcula acelerações N-body.
+
+        Usa NumPy quando vale a pena e mantém fallback Python.
+        A lógica continua simétrica: pares i/j não dependem da ordem de atualização.
+        """
+        n = len(bodies)
+        if n == 0:
+            return
+
+        if np is not None and getattr(self, "use_numpy_gravity", True) and n >= 32:
+            pos = np.array([(b.pos.x, b.pos.y) for b in bodies], dtype=float)
+            mass = np.array([max(float(b.mass), 1e-12) for b in bodies], dtype=float)
+
+            dx = pos[None, :, 0] - pos[:, None, 0]
+            dy = pos[None, :, 1] - pos[:, None, 1]
+            ds2 = dx * dx + dy * dy + 25.0
+            np.fill_diagonal(ds2, np.inf)
+            inv_dist = 1.0 / np.sqrt(ds2)
+
+            factor = G * mass[None, :] / ds2
+            ax = np.sum(factor * dx * inv_dist, axis=1)
+            ay = np.sum(factor * dy * inv_dist, axis=1)
+
+            for i, b in enumerate(bodies):
+                b.acc = pygame.Vector2(float(ax[i]), float(ay[i]))
+            return
+
+        for b in bodies:
+            b.acc = pygame.Vector2(0.0, 0.0)
+
+        for i in range(n):
+            a = bodies[i]
+            for j in range(i + 1, n):
+                b = bodies[j]
+                dx = b.pos.x - a.pos.x
+                dy = b.pos.y - a.pos.y
+                ds2 = dx * dx + dy * dy + 25.0
+                ds = math.sqrt(ds2)
+                f = G * a.mass * b.mass / ds2
+                fx = f * dx / ds
+                fy = f * dy / ds
+                a.acc.x += fx / a.mass
+                a.acc.y += fy / a.mass
+                b.acc.x -= fx / b.mass
+                b.acc.y -= fy / b.mass
 
     def simulate_preview(self, new_body_data, steps=80, step_dt=0.4):
-        ghosts = [Body(b.pos.x,b.pos.y,b.vel.x,b.vel.y,b.mass,b.radius,b.color,"") for b in self.bodies]
-        nb = Body(new_body_data["pos"].x, new_body_data["pos"].y, new_body_data["vel"].x, new_body_data["vel"].y, new_body_data["mass"], new_body_data["radius"], new_body_data["color"], "")
+        ghosts = [
+            Body(b.pos.x, b.pos.y, b.vel.x, b.vel.y, b.mass, b.radius, b.color, "")
+            for b in self.bodies
+        ]
+
+        nb = Body(
+            new_body_data["pos"].x,
+            new_body_data["pos"].y,
+            new_body_data["vel"].x,
+            new_body_data["vel"].y,
+            new_body_data["mass"],
+            new_body_data["radius"],
+            new_body_data["color"],
+            "",
+        )
+
         ghosts.append(nb)
-        trail=[]
+        trail = []
+
+        sdt = step_dt * self.time_scale * 0.08
+        half_dt = 0.5 * sdt
+
         for _ in range(steps):
-            for b in ghosts: b.acc = pygame.Vector2(0,0)
-            for ii in range(len(ghosts)):
-                ga = ghosts[ii]
-                for gb in ghosts[ii+1:]:
-                    dx = gb.pos.x - ga.pos.x; dy = gb.pos.y - ga.pos.y
-                    ds2 = dx*dx + dy*dy + 25.0
-                    ds  = math.sqrt(ds2)
-                    f   = G * ga.mass * gb.mass / ds2
-                    ga.acc.x += f*dx/ds/ga.mass; ga.acc.y += f*dy/ds/ga.mass
-                    gb.acc.x -= f*dx/ds/gb.mass; gb.acc.y -= f*dy/ds/gb.mass
-            sdt = step_dt * self.time_scale * 0.08
+            # Velocity Verlet / Leapfrog:
+            # kick meio passo -> drift completo -> recalcula força -> kick meio passo.
+            self._compute_accelerations_for(ghosts)
+
             for b in ghosts:
-                b.vel += b.acc * sdt
+                b.vel += b.acc * half_dt
                 b.pos += b.vel * sdt
+
+            self._compute_accelerations_for(ghosts)
+
+            for b in ghosts:
+                b.vel += b.acc * half_dt
+
             trail.append(pygame.Vector2(nb.pos))
+
         return trail
 
     def step(self, dt):
@@ -898,15 +1289,33 @@ class Simulation:
         sdt = dt * self.time_scale * 0.08 / SUB
         self.time_elapsed += dt * self.time_scale * 0.08
         for _ in range(SUB):
+            half_dt = 0.5 * sdt
+
+            # Velocity Verlet / Leapfrog:
+            # 1) forças atuais
+            # 2) kick de meio passo
+            # 3) drift completo
+            # 4) forças novas
+            # 5) kick de meio passo
             self._compute_accelerations()
+
             for b in self.bodies:
-                b.vel += b.acc * sdt
+                b.vel += b.acc * half_dt
                 _limit_giant_velocity(b)
                 b.pos += b.vel * sdt
+
+            self._compute_accelerations()
+
+            for b in self.bodies:
+                b.vel += b.acc * half_dt
+                _limit_giant_velocity(b)
+
+            self.check_roche()
             self.check_collisions()
         for b in self.bodies[:]:
             ensure_structure(b)
             relax_structure(b, dt * self.time_scale)
+            relax_internal_layers(b, dt * self.time_scale)
             b.age = getattr(b, "age", 0.0) + dt * self.time_scale
             if getattr(b, "collision_cooldown", 0.0) > 0:
                 b.collision_cooldown = max(0.0, b.collision_cooldown - dt)
@@ -960,6 +1369,11 @@ class Simulation:
             trail_limit = FRAGMENT_TRAIL_LIMIT if getattr(b, "is_fragment", False) else BODY_TRAIL_LIMIT
             if len(b.trail) > trail_limit:
                 b.trail = b.trail[-trail_limit:]
+        valid_ids = {id(b) for b in self.bodies}
+        for key in list(getattr(self, "stellar_contacts", {}).keys()):
+            if key[0] not in valid_ids or key[1] not in valid_ids:
+                self.stellar_contacts.pop(key, None)
+
         for ev in self.collision_events[:]:
             ev.timer -= dt
             if ev.timer <= 0: self.collision_events.remove(ev)

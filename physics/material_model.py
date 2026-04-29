@@ -99,9 +99,9 @@ def infer_material(body) -> str:
     mass = getattr(body, "mass", 0.0)
     explicit = getattr(body, "material", None)
 
-    if mass >= 5.0e6:
+    if mass >= 1.0e9:
         return "blackhole"
-    if mass >= 8.0e5:
+    if mass >= 5.0e7:
         return "plasma"
     if mass >= 5.0e4:
         return "gas"

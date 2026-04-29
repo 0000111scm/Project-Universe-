@@ -41,7 +41,10 @@ def _apply_catalog_physics(body, entry):
         return body
     body.has_rings = bool(entry.get("has_rings", False))
     body.base_color = entry.get("color", body.color)
-    if body.mass >= 8e5:
+    body.luminosity = float(entry.get("luminosity", 0.0))
+    if body.mass >= 1e9:
+        body.material = "blackhole"
+    elif body.mass >= 5e7:
         body.material = "plasma"
     elif body.mass >= 5e4:
         body.material = "gas"
@@ -61,7 +64,7 @@ def _add_stable(x, y, vx, vy, mass, radius, color, name):
 _add_stable(cx, cy, 0, 0, M_SOL, 30, (255,210,50), "Sol")
 _add_stable(cx+150, cy, 0, orbital_velocity(M_SOL,150), 1e3, 8,  (0,120,255),   "Terra")
 _add_stable(cx+225, cy, 0, orbital_velocity(M_SOL,225), 8e2, 6,  (200,80,50),   "Marte")
-_add_stable(cx+780, cy, 0, orbital_velocity(M_SOL,780), 5e2, 10, (180,140,80),  "Júpiter")
+_add_stable(cx+780, cy, 0, orbital_velocity(M_SOL,780), 3e5, 16, (180,140,80),  "Júpiter")
 
 TABS       = list(BODY_CATALOG.keys())
 active_tab = 0
@@ -149,21 +152,18 @@ pause_rect        = None
 #  FÍSICA CORRIGIDA
 # ══════════════════════════════════════════
 def get_luminosity(body):
-    """Busca luminosidade por FAIXA DE MASSA, não por nome."""
+    """Luminosidade vem do catálogo quando disponível; massa é fallback."""
+    lum = getattr(body, "luminosity", None)
+    if lum is not None:
+        return lum
+
     m = body.mass
-    if m >= 1e11:   return 1e10   # galáxia
-    if m >= 1e9:    return 0      # BN supermassivo
-    if m >= 1e8:    return 5e6    # Eta Carinae-like
-    if m >= 5e7:    return 1e6    # hipergigante
-    if m >= 2e7:    return 1e5    # supergigante
-    if m >= 8e6:    return 5e4    # gigante grande
-    if m >= 4e6:    return 1e4    # gigante
-    if m >= 2.5e6:  return 1e3    # subgigante grande
-    if m >= 1.5e6:  return 50     # gigante amarela
-    if m >= 1.2e6:  return 10     # anã azul
-    if m >= 8e5:    return 2      # sol-like / anã branca
-    if m >= 2e5:    return 0.01   # anã vermelha
-    return 0  # planeta, lua, asteroide etc
+    if m >= 1e12:   return 1e10
+    if m >= 1e9:    return 0
+    if m >= 5e10:   return 5e6
+    if m >= 1e10:   return 1e5
+    if m >= 5e7:    return 1.0
+    return 0
 
 def body_temperature(body):
     """
@@ -188,13 +188,9 @@ def body_temperature(body):
     return max(3, min(int(temp), 200000))
 
 def body_type_str(body):
-    if body.mass >= 1e11:  return "Galáxia"
-    if body.mass >= 1e9:   return "BN Supermassivo"
-    if body.mass >= 5e6:   return "Buraco Negro"
-    if body.mass >= 4e6:   return "Estrela de Nêutrons"
-    if body.mass >= 2e7:   return "Hipergigante"
-    if body.mass >= 3e6:   return "Gigante/Supergigante"
-    if body.mass >= 2e5:   return "Estrela"
+    if body.mass >= 1e12:  return "Galáxia / Núcleo Ativo"
+    if body.mass >= 1e9 and getattr(body, "material", "") == "blackhole": return "Buraco Negro"
+    if body.mass >= 5e7:   return "Estrela"
     if body.mass >= 5e4:   return "Gigante Gasoso"
     if body.mass >= 5e2:   return "Planeta"
     if body.mass >= 1e2:   return "Planeta Anão"
@@ -1479,11 +1475,9 @@ while running:
         zoom += (zoom_target - zoom) * min(1.0, dt * 10.0)
 
     if followed_body and followed_body in sim.bodies:
-        target_offset = pygame.Vector2(
-            SIM_W/2/zoom-followed_body.pos.x,
-            HEIGHT/2/zoom-followed_body.pos.y
-        )
-        camera_offset += (target_offset - camera_offset) * min(1.0, dt * 6.5)
+        # world_to_screen: (pos + cam) * zoom + centro - (cx,cy)*zoom.
+        # Para centralizar em qualquer zoom: cam = (cx, cy) - pos.
+        camera_offset = pygame.Vector2(cx - followed_body.pos.x, cy - followed_body.pos.y)
 
     for event in pygame.event.get():
         if event.type==pygame.QUIT: running=False
@@ -1514,8 +1508,8 @@ while running:
                 sim.performance_mode = performance_mode
                 orbit_cache.clear()
             if event.key==pygame.K_x:
-                if zoom>0.1:
-                    zoom=zoom_target=0.04; camera_offset=pygame.Vector2(0,0)
+                if zoom>0.02:
+                    zoom=zoom_target=0.008; camera_offset=pygame.Vector2(0,0)
                 else:
                     zoom=zoom_target=1.0
             if event.key==pygame.K_F5:     save_simulation()
@@ -1549,10 +1543,11 @@ while running:
                     selected_type=None
                     selected_body=None
                     followed_body=None
-            if event.key==pygame.K_w: camera_offset.y+=20/zoom
-            if event.key==pygame.K_s: camera_offset.y-=20/zoom
-            if event.key==pygame.K_a: camera_offset.x+=20/zoom
-            if event.key==pygame.K_d: camera_offset.x-=20/zoom
+            pan_step = 40 / zoom
+            if event.key==pygame.K_w: camera_offset.y += pan_step
+            if event.key==pygame.K_s: camera_offset.y -= pan_step
+            if event.key==pygame.K_a: camera_offset.x += pan_step
+            if event.key==pygame.K_d: camera_offset.x -= pan_step
             # trocar modo gráfico
             if event.key==pygame.K_TAB and show_graph:
                 gi=graph_modes.index(graph_mode)
@@ -1590,18 +1585,21 @@ while running:
                 _add_stable(cx, cy, 0, 0, M_SOL, 30, (255,210,50), "Sol")
                 _add_stable(cx+150, cy, 0, orbital_velocity(M_SOL,150), 1e3, 8,  (0,120,255),   "Terra")
                 _add_stable(cx+225, cy, 0, orbital_velocity(M_SOL,225), 8e2, 6,  (200,80,50),   "Marte")
-                _add_stable(cx+780, cy, 0, orbital_velocity(M_SOL,780), 5e2, 10, (180,140,80),  "Júpiter")
+                _add_stable(cx+780, cy, 0, orbital_velocity(M_SOL,780), 3e5, 16, (180,140,80),  "Júpiter")
                 planet_count = 4
 
         if event.type==pygame.MOUSEWHEEL:
             mx,my=pygame.mouse.get_pos()
             if mx<SIM_W:
                 before = screen_to_world(mx, my, camera_offset, zoom, cx, cy)
-                factor = 1.16 ** event.y
-                zoom = max(0.04, min(zoom * factor, 28.0))
+                factor = 1.25 ** event.y
+                zoom = max(0.005, min(zoom * factor, 60.0))
                 zoom_target = zoom
                 after = screen_to_world(mx, my, camera_offset, zoom, cx, cy)
-                camera_offset += (after - before)
+                if followed_body and followed_body in sim.bodies:
+                    camera_offset = pygame.Vector2(cx - followed_body.pos.x, cy - followed_body.pos.y)
+                else:
+                    camera_offset += (after - before)
             else:
                 panel_scroll=max(0,panel_scroll-event.y*20)
 
@@ -1689,6 +1687,15 @@ while running:
                     paused = not paused
                     ui_consumed = True
 
+                # Botões de velocidade precisam ter prioridade sobre lista/tabs do painel.
+                if not ui_consumed:
+                    for i,rect in enumerate(btn_rects_time):
+                        if rect.collidepoint(mx,my):
+                            sim.time_scale = TIME_SCALES[i]
+                            paused = False
+                            ui_consumed = True
+                            break
+
                 if not ui_consumed and advanced_rect and advanced_rect.collidepoint(mx,my):
                     show_advanced_options = not show_advanced_options
                     ui_consumed = True
@@ -1766,7 +1773,10 @@ while running:
                             followed_body=hit
                         else:
                             selected_body=hit; editing_name=False
-                            if hit: hit.atmosphere=estimate_atmosphere(hit)
+                            if hit:
+                                hit.atmosphere=estimate_atmosphere(hit)
+                            elif followed_body is not None and mx < SIM_W:
+                                followed_body = None
 
                         # PATCH 43:
                         # Pausado = editor orbital seguro.
@@ -1816,12 +1826,7 @@ while running:
                         )
                         nb.base_color   = btype["color"]
                         nb.has_rings    = bool(btype.get("has_rings", False))
-                        if nb.mass >= 8e5:
-                            nb.material = "plasma"
-                        elif nb.mass >= 5e4:
-                            nb.material = "gas"
-                        else:
-                            nb.material = getattr(nb, "material", "rock")
+                        _apply_catalog_physics(nb, btype)
                         if not hasattr(nb,'_terra_set'):
                             nb.atmosphere = estimate_atmosphere(nb)
                             nb.water      = 1.0 if nb.mass>=500 else 0.0
