@@ -899,6 +899,35 @@ class Simulation:
             recoil = _cap_vector(recoil, max(2.0, rel_speed * 0.18))
             source.vel -= recoil
 
+        # PATCH 56 — formação inicial de anéis/detritos orbitais.
+        # Só corpos não estelares podem ganhar anéis.
+        if (
+            source in self.bodies
+            and not _is_star_like(source)
+            and getattr(source, "material", "") not in ("plasma", "blackhole")
+            and created_mass >= MIN_FRAGMENT_MASS * 3
+        ):
+            local_fragments = [
+                b for b in self.bodies
+                if getattr(b, "is_fragment", False)
+                and (b.pos - source.pos).length() < max(source.radius * 5.0, source.radius + 20.0)
+            ]
+
+            if len(local_fragments) >= 3:
+                tangential_score = 0
+                for frag in local_fragments:
+                    r = frag.pos - source.pos
+                    v = frag.vel - source.vel
+                    if r.length_squared() == 0 or v.length_squared() == 0:
+                        continue
+                    radial = abs(v.dot(r.normalize()))
+                    tangential = max(0.0, v.length() - radial)
+                    if tangential > radial * 0.55:
+                        tangential_score += 1
+
+                if tangential_score >= max(2, len(local_fragments) // 2):
+                    source.has_rings = True
+
         self.collision_events.append(CollisionEvent(source.pos, kind))
 
     def _fragment_collision(self, a, b, destructive=False, impact=None):
