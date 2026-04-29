@@ -376,22 +376,7 @@ class Simulation:
         return True
 
     def _compute_accelerations(self):
-        for b in self.bodies:
-            b.acc = pygame.Vector2(0.0, 0.0)
-        n = len(self.bodies)
-        for i in range(n):
-            a = self.bodies[i]
-            for j in range(i + 1, n):
-                b = self.bodies[j]
-                dx = b.pos.x - a.pos.x
-                dy = b.pos.y - a.pos.y
-                ds2 = dx*dx + dy*dy + 25.0
-                ds  = math.sqrt(ds2)
-                f   = G * a.mass * b.mass / ds2
-                fx  = f * dx / ds
-                fy  = f * dy / ds
-                a.acc.x += fx / a.mass; a.acc.y += fy / a.mass
-                b.acc.x -= fx / b.mass; b.acc.y -= fy / b.mass
+        self._compute_accelerations_for(self.bodies)
 
     def _separate(self, a, b):
         d = b.pos - a.pos
@@ -862,26 +847,41 @@ class Simulation:
     def check_roche(self):
         pass
 
+    def _compute_accelerations_for(self, bodies):
+        for b in bodies:
+            b.acc = pygame.Vector2(0.0, 0.0)
+        n = len(bodies)
+        for i in range(n):
+            a = bodies[i]
+            for j in range(i + 1, n):
+                b = bodies[j]
+                dx = b.pos.x - a.pos.x
+                dy = b.pos.y - a.pos.y
+                ds2 = dx * dx + dy * dy + 25.0
+                ds = math.sqrt(ds2)
+                f = G * a.mass * b.mass / ds2
+                fx = f * dx / ds
+                fy = f * dy / ds
+                a.acc.x += fx / a.mass
+                a.acc.y += fy / a.mass
+                b.acc.x -= fx / b.mass
+                b.acc.y -= fy / b.mass
+
     def simulate_preview(self, new_body_data, steps=80, step_dt=0.4):
         ghosts = [Body(b.pos.x,b.pos.y,b.vel.x,b.vel.y,b.mass,b.radius,b.color,"") for b in self.bodies]
         nb = Body(new_body_data["pos"].x, new_body_data["pos"].y, new_body_data["vel"].x, new_body_data["vel"].y, new_body_data["mass"], new_body_data["radius"], new_body_data["color"], "")
         ghosts.append(nb)
         trail=[]
+        sdt = step_dt * self.time_scale * 0.08
         for _ in range(steps):
-            for b in ghosts: b.acc = pygame.Vector2(0,0)
-            for ii in range(len(ghosts)):
-                ga = ghosts[ii]
-                for gb in ghosts[ii+1:]:
-                    dx = gb.pos.x - ga.pos.x; dy = gb.pos.y - ga.pos.y
-                    ds2 = dx*dx + dy*dy + 25.0
-                    ds  = math.sqrt(ds2)
-                    f   = G * ga.mass * gb.mass / ds2
-                    ga.acc.x += f*dx/ds/ga.mass; ga.acc.y += f*dy/ds/ga.mass
-                    gb.acc.x -= f*dx/ds/gb.mass; gb.acc.y -= f*dy/ds/gb.mass
-            sdt = step_dt * self.time_scale * 0.08
+            self._compute_accelerations_for(ghosts)
+            half_dt = 0.5 * sdt
             for b in ghosts:
-                b.vel += b.acc * sdt
+                b.vel += b.acc * half_dt
                 b.pos += b.vel * sdt
+            self._compute_accelerations_for(ghosts)
+            for b in ghosts:
+                b.vel += b.acc * half_dt
             trail.append(pygame.Vector2(nb.pos))
         return trail
 
@@ -899,10 +899,15 @@ class Simulation:
         self.time_elapsed += dt * self.time_scale * 0.08
         for _ in range(SUB):
             self._compute_accelerations()
+            half_dt = 0.5 * sdt
             for b in self.bodies:
-                b.vel += b.acc * sdt
+                b.vel += b.acc * half_dt
                 _limit_giant_velocity(b)
                 b.pos += b.vel * sdt
+            self._compute_accelerations()
+            for b in self.bodies:
+                b.vel += b.acc * half_dt
+                _limit_giant_velocity(b)
             self.check_collisions()
         for b in self.bodies[:]:
             ensure_structure(b)
