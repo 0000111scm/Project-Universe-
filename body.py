@@ -8,26 +8,27 @@ class Body:
         self.mass        = mass
         self.radius      = radius
         self.color       = color
-        self.base_color  = color  # cor original para água visual
+        self.base_color  = color
         self.name        = name
         self.trail       = []
         self.temperature = 300.0
         self.alive       = True
-        # Propriedades físicas simuladas
-        self.atmosphere  = 1.0 if mass >= 100 else 0.0   # 0–2 bar estimado
-        self.water       = 1.0 if mass >= 500 else 0.0   # 0–1 cobertura
+        self.atmosphere  = 1.0 if mass >= 100 else 0.0
+        self.water       = 1.0 if mass >= 500 else 0.0
         self.has_life    = False
-        self.age         = 0.0   # segundos de simulação
+        self.age         = 0.0
         self.show_label  = True
         self.label_timer = 0.0
         self.is_fragment = False
-        # Estado ambiental dinâmico
-        self.co2         = 0.0
-        self.n2          = 0.0
-        self.albedo      = 0.3
-        self.water_vapor = 0.0
-        self.ice_fraction= 0.0
-        self.tidal_heat  = 0.0
-        self.volcanism   = 0.0
-        self.roche_stress= 0.0
-        self.born_timer  = 0.0
+
+        # Patch 29/30: base para fragmentos irregulares e impactos locais.
+        self.material     = None
+        self.density      = 1.0
+        self.angular_velocity = 0.0
+        self.rotation     = 0.0
+        self.irregular_points = []
+        self.surface_marks = []      # crateras/cicatrizes simples em 2D
+        self.local_heat_points = []  # pontos quentes de impacto, base do grid futuro
+        self.surface_grid = []       # Patch 31: grade local de superficie 2D
+        self.impact_heat  = 0.0
+        self.deformation  = 0.0

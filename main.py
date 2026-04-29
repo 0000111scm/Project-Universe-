@@ -10,13 +10,6 @@ from catalog import BODY_CATALOG, STELLAR_EVOLUTION
 from camera import screen_to_world, world_to_screen
 from visuals.background import create_space_layers, draw_space_background
 from systems.labels import should_draw_body_label, compact_body_label
-from systems.orbits import predict_nbody_paths, make_cache_signature
-from physics.environment import stellar_luminosity, equilibrium_temperature, update_environment, radiative_flux
-from visuals.body_render import draw_selection_rings, draw_temperature_badge
-from physics.habitability import habitability_report
-from physics.units import fmt_temp_c, fmt_mass, fmt_speed, fmt_distance_au, fmt_acceleration, kelvin_to_celsius, fmt_num_br
-from physics.presets import apply_preset
-from visuals.panel import draw_factor_bar
 
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -41,14 +34,6 @@ _add_stable(cx+150, cy, 0, orbital_velocity(M_SOL,150), 1e3, 8,  (0,120,255),   
 _add_stable(cx+225, cy, 0, orbital_velocity(M_SOL,225), 8e2, 6,  (200,80,50),   "Marte")
 _add_stable(cx+780, cy, 0, orbital_velocity(M_SOL,780), 5e2, 10, (180,140,80),  "Júpiter")
 
-
-BODY_CATALOG["Presets"] = [
-    {"name":"Sistema Solar", "desc":"preset limpo", "color":(255,210,80), "preset":"sistema_solar", "mass":0, "radius":1, "has_rings":False, "luminosity":0},
-    {"name":"Sistema Binário", "desc":"duas estrelas", "color":(255,160,80), "preset":"binaria", "mass":0, "radius":1, "has_rings":False, "luminosity":0},
-    {"name":"Colisão Lua-Terra", "desc":"Theia", "color":(130,190,255), "preset":"colisao_lua_terra", "mass":0, "radius":1, "has_rings":False, "luminosity":0},
-    {"name":"Campo Asteroides", "desc":"80 corpos", "color":(160,145,110), "preset":"asteroides", "mass":0, "radius":1, "has_rings":False, "luminosity":0},
-]
-
 TABS       = list(BODY_CATALOG.keys())
 active_tab = 0
 
@@ -65,13 +50,13 @@ show_graph     = False
 show_gravity_zone = False
 show_barycenter   = False
 performance_mode  = False
+advanced_view     = False
 graph_mode     = "temp"  # "temp" | "vel" | "mass"
 
 flares      = []
 flare_timers= {}
 collision_particles = []
 orbit_cache = {}
-orbit_cache_sig = None
 
 
 # ══════════════════════════════════════════
@@ -107,11 +92,6 @@ slider_drag_start_val = 0.0
 body_ages          = {}
 graph_history      = {}   # body_id → {temp:[], vel:[], mass:[]}
 current_slot       = 0
-moving_body        = None
-move_rect          = None
-body_dragging      = False
-body_drag_target   = None
-body_drag_offset   = pygame.Vector2(0, 0)
 
 def get_save_path():
     if current_slot == 0: return SAVE_FILE
@@ -131,44 +111,48 @@ save_rect         = None
 load_rect         = None
 
 
-def get_catalog_entry(selected):
-    """Retorna item do catalogo com protecao contra indice invalido."""
-    if selected is None:
-        return None
-    try:
-        tab_i, body_i = selected
-        tabs = list(BODY_CATALOG.values())
-        if tab_i < 0 or tab_i >= len(tabs):
-            return None
-        bodies = tabs[tab_i]
-        if body_i < 0 or body_i >= len(bodies):
-            return None
-        return bodies[body_i]
-    except Exception:
-        return None
-
-
-def validate_selected_type():
-    global selected_type
-    if selected_type is not None and get_catalog_entry(selected_type) is None:
-        selected_type = None
-    return selected_type is not None
-
-
-
 
 # ══════════════════════════════════════════
 #  FÍSICA CORRIGIDA
 # ══════════════════════════════════════════
 def get_luminosity(body):
-    """Luminosidade física aproximada; BN/galáxias não aquecem como estrela comum."""
-    return stellar_luminosity(body)
+    """Busca luminosidade por FAIXA DE MASSA, não por nome."""
+    m = body.mass
+    if m >= 1e11:   return 1e10   # galáxia
+    if m >= 1e9:    return 0      # BN supermassivo
+    if m >= 1e8:    return 5e6    # Eta Carinae-like
+    if m >= 5e7:    return 1e6    # hipergigante
+    if m >= 2e7:    return 1e5    # supergigante
+    if m >= 8e6:    return 5e4    # gigante grande
+    if m >= 4e6:    return 1e4    # gigante
+    if m >= 2.5e6:  return 1e3    # subgigante grande
+    if m >= 1.5e6:  return 50     # gigante amarela
+    if m >= 1.2e6:  return 10     # anã azul
+    if m >= 8e5:    return 2      # sol-like / anã branca
+    if m >= 2e5:    return 0.01   # anã vermelha
+    return 0  # planeta, lua, asteroide etc
 
 def body_temperature(body):
-    """Temperatura atual dinâmica. O alvo radiativo vem de physics/environment.py."""
-    if hasattr(body, "temperature"):
-        return max(3, min(int(body.temperature), 250000))
-    return int(equilibrium_temperature(body, sim.bodies, HAB_SCALE))
+    """
+    T = 278 * (flux_total)^0.25
+    flux = sum(L_estrela / d_UA²)
+    d_UA = dist_px / HAB_SCALE
+    Terra (150px do Sol, L=2): T = 278*(2/1)^0.25 ≈ 331K ~ OK
+    """
+    flux = 0.0
+    for s in sim.bodies:
+        if s is body: continue
+        lum = get_luminosity(s)
+        if lum <= 0: continue
+        dist_px = max((body.pos - s.pos).length(), 1.0)
+        dist_ua = dist_px / HAB_SCALE
+        flux   += lum / (dist_ua ** 2)
+    # efeito estufa da atmosfera
+    atm_factor = 1.0 + getattr(body,'atmosphere',0)*0.15
+    if flux <= 0:
+        return max(3, int(3 * atm_factor))
+    temp = 278.0 * (flux ** 0.25) * atm_factor
+    return max(3, min(int(temp), 200000))
 
 def body_type_str(body):
     if body.mass >= 1e11:  return "Galáxia"
@@ -185,13 +169,52 @@ def body_type_str(body):
     return "Corpo Menor"
 
 def life_probability(body):
-    """Pontuação de habitabilidade 0-100 baseada em fatores físicos explicáveis."""
-    return habitability_report(body, sim.bodies, HAB_SCALE)["score"]
+    """
+    Condições:
+    1. Deve ser planeta (50 ≤ massa ≤ 50000)
+    2. Não pode ter luminosidade (não é estrela)
+    3. Temperatura entre 200K e 450K
+    4. Fator de massa planetária
+    5. Precisa haver ao menos uma estrela no sistema
+    """
+    if body.mass < 50 or body.mass > 5e4: return 0.0
+    if get_luminosity(body) > 0:          return 0.0
 
-def water_state(temp_k):
-    if temp_k < 273.15:  return "Gelo",    (160,210,255)
-    if temp_k <= 373.15: return "Líquida", (50,150,255)
-    return "Vapor",              (200,210,255)
+    temp = body_temperature(body)
+    if temp <= 0: return 0.0
+
+    # Curva gaussiana centrada em 288K (Terra), largura 70K
+    temp_factor = math.exp(-((temp - 288)**2) / (2 * 70**2))
+
+    # Fator de massa
+    if body.mass < 100:
+        mass_factor = (body.mass - 50) / 50.0
+    elif body.mass <= 8000:
+        mass_factor = 1.0
+    elif body.mass <= 30000:
+        mass_factor = 1.0 - (body.mass - 8000) / 22000.0
+    else:
+        mass_factor = 0.0
+
+    # Fator atmosférico
+    atm = getattr(body, 'atmosphere', 0)
+    atm_factor = min(atm, 1.0) if atm > 0 else 0.3
+
+    # Fator água
+    water = getattr(body, 'water', 0)
+    water_factor = min(water, 1.0) if water > 0 else 0.2
+
+    # Presença de estrela
+    has_star = any(get_luminosity(s) > 0 and s is not body for s in sim.bodies)
+    star_factor = 1.0 if has_star else 0.05
+
+    prob = temp_factor * mass_factor * atm_factor * water_factor * star_factor * 100.0
+    return round(max(0.0, min(prob, 100.0)), 1)
+
+def water_state(temp):
+    if temp < 273:  return "Gelo ❄",    (160,210,255)
+    if temp <= 373: return "Líquida 💧", (50,150,255)
+    return "Vapor 💨",              (200,210,255)
 
 def hab_zone_radii(body):
     lum = get_luminosity(body)
@@ -250,8 +273,6 @@ def draw_terraforming_panel(body):
     wtr = getattr(body,'water',0)
     co2 = getattr(body,'co2',0)
     n2  = getattr(body,'n2',0)
-    o2  = getattr(body,'o2',0)
-    ch4 = getattr(body,'ch4',0)
     alb = getattr(body,'albedo',0.3)
     temp = body_temperature(body)
     life = life_probability(body)
@@ -259,9 +280,7 @@ def draw_terraforming_panel(body):
         ("Atmosfera", f"{atm:.2f} bar", "atm",    (100,200,255),(60,80,120),   0.0, 3.0,  0.1),
         ("\xc1gua",   f"{wtr:.2f}",     "water",  (50,130,255), (30,60,160),   0.0, 1.0,  0.1),
         ("CO2",       f"{co2:.2f} bar", "co2",    (200,160,80), (120,80,30),   0.0, 2.0,  0.1),
-        ("N2",        f"{n2:.2f} bar",  "n2",     (120,200,120),(60,120,60),   0.0, 3.0,  0.1),
-        ("O2",        f"{o2:.2f} bar",  "o2",     (120,220,255),(50,110,150),  0.0, 1.5,  0.05),
-        ("CH4",       f"{ch4:.2f} bar", "ch4",    (180,140,220),(90,60,130),   0.0, 1.0,  0.05),
+        ("N2",        f"{n2:.2f} bar",  "n2",     (120,200,120),(60,120,60),   0.0, 2.0,  0.1),
         ("Albedo",    f"{alb:.2f}",     "albedo", (200,200,200),(100,100,100), 0.05,0.95, 0.05),
     ]
     h_panel = 34 + len(params)*22 + 48
@@ -286,7 +305,7 @@ def draw_terraforming_panel(body):
         terra_btn_rects[f"{key}_dn"]=(r_dn,step,mn,mx_v)
         y0+=22
     lc=(80,255,100) if life>10 else (180,180,180)
-    screen.blit(font_small.render(f"Temp: {fmt_temp_c(temp)}   Vida: {life}%",True,lc),(x0,y0))
+    screen.blit(font_small.render(f"Temp: ~{temp}K   Vida: {life}%",True,lc),(x0,y0))
     y0+=20
     r_save =pygame.Rect(x0,    y0,100,20)
     r_close=pygame.Rect(x0+108,y0,100,20)
@@ -304,7 +323,7 @@ def draw_terraforming_panel(body):
 # ══════════════════════════════════════════
 GRAPH_W, GRAPH_H = 220, 100
 graph_modes = ["temp","vel","mass","life"]
-graph_labels = {"temp":"Temperatura (°C)","vel":"Velocidade (km/s)","mass":"Massa","life":"Habitabilidade (%)"}
+graph_labels = {"temp":"Temperatura (K)","vel":"Velocidade (u/s)","mass":"Massa","life":"Habitabilidade (%)"}
 graph_colors = {"temp":(255,180,80),"vel":(80,200,255),"mass":(180,100,255),"life":(80,255,120)}
 
 def update_graph(dt):
@@ -315,8 +334,8 @@ def update_graph(dt):
         h = graph_history[bid]
         for _k in ("temp","vel","mass","life"):
             if _k not in h: h[_k] = []
-        h["temp"].append(kelvin_to_celsius(body_temperature(body)))
-        h["vel"].append(float(fmt_speed(body.vel.length(), HAB_SCALE).split()[0].replace(".", "").replace(",", ".")))
+        h["temp"].append(body_temperature(body))
+        h["vel"].append(body.vel.length())
         h["mass"].append(body.mass)
         h["life"].append(life_probability(body))
         for k in h:
@@ -377,15 +396,7 @@ def save_simulation():
             "name":b.name,"atmosphere":getattr(b,'atmosphere',0),
             "water":getattr(b,'water',0),
             "is_fragment":getattr(b,'is_fragment',False),
-            "show_label":getattr(b,'show_label',True),
-            "born_timer":getattr(b,'born_timer',999.0),
-            "temperature":getattr(b,'temperature',300.0),
-            "co2":getattr(b,'co2',0.0),
-            "n2":getattr(b,'n2',0.0),
-            "o2":getattr(b,'o2',0.0),
-            "ch4":getattr(b,'ch4',0.0),
-            "surface_pressure":getattr(b,'surface_pressure',getattr(b,'atmosphere',0.0)),
-            "albedo":getattr(b,'albedo',0.3)
+            "show_label":getattr(b,'show_label',True)
         })
     with open(SAVE_FILE,"w") as f: json.dump(data,f,indent=2)
 
@@ -402,13 +413,8 @@ def load_simulation():
         b.is_fragment = bd.get("is_fragment",False)
         b.show_label  = bd.get("show_label", not b.is_fragment)
         b.label_timer = 0.0
-        b.born_timer = bd.get("born_timer", 999.0)
-        b.temperature = bd.get("temperature", 300.0)
         b.co2         = bd.get("co2",0)
         b.n2          = bd.get("n2",0)
-        b.o2          = bd.get("o2",0)
-        b.ch4         = bd.get("ch4",0)
-        b.surface_pressure = bd.get("surface_pressure", b.atmosphere)
         b.albedo      = bd.get("albedo",0.3)
         b._terra_set  = True
         sim.add_body(b)
@@ -559,42 +565,66 @@ def draw_roche_limit():
                 rs=pygame.transform.rotate(de,-math.degrees(angle))
                 screen.blit(rs,(ssx-rs.get_width()//2,ssy-rs.get_height()//2))
 
-def _get_orbit_paths():
-    """Cache global de predicao orbital N-body real."""
-    global orbit_cache, orbit_cache_sig
-    quality = 0 if performance_mode else 1
-    sig = make_cache_signature(sim.bodies, quality_bucket=quality)
-    if sig != orbit_cache_sig:
-        steps = 90 if performance_mode else 180
-        stride = 4 if performance_mode else 3
-        max_bodies = 45 if performance_mode else 80
-        orbit_cache = predict_nbody_paths(sim.bodies, steps=steps, dt=0.018, stride=stride, max_bodies=max_bodies)
-        orbit_cache_sig = sig
-    return orbit_cache
-
-
 def draw_orbit_prediction(body):
-    """Predicao visual N-body: integra todos os corpos importantes, nao so 1 atrator."""
-    if not sim.bodies:
-        return
-    if performance_mode and getattr(body, "is_fragment", False):
-        return
-    if len(sim.bodies) > 140 and body.mass < 50:
-        return
+    """Orbita analitica com cache simples para reduzir custo quando ha muitos corpos."""
+    if not sim.bodies: return
+    if performance_mode and getattr(body, "is_fragment", False): return
+    if len(sim.bodies) > 120 and body.mass < 10: return
 
-    world_pts = _get_orbit_paths().get(id(body))
-    if not world_pts or len(world_pts) < 2:
-        return
+    others=[b for b in sim.bodies if b is not body]
+    if not others: return
+    attractor=max(others,key=lambda b:b.mass)
+
+    cache_key = (
+        id(body), id(attractor),
+        int(body.pos.x//4), int(body.pos.y//4),
+        int(body.vel.x//2), int(body.vel.y//2),
+        int(attractor.pos.x//4), int(attractor.pos.y//4),
+        int(attractor.mass//1000)
+    )
+    world_pts = orbit_cache.get(cache_key)
+    if world_pts is None:
+        delta=body.pos-attractor.pos
+        dist=delta.length()
+        if dist<1: return
+        speed=body.vel.length()
+        if speed<0.01: return
+        mu=G*attractor.mass
+        try:
+            energy=0.5*speed**2-mu/dist
+            if energy>=0: return
+            a=-mu/(2*energy)
+            if a <= 0 or a > 20000: return
+            h=abs(delta.x*body.vel.y-delta.y*body.vel.x)
+            p=h**2/mu
+            ecc=math.sqrt(max(0,1-p/a))
+            if ecc>=1: return
+            b_axis=a*math.sqrt(1-ecc**2)
+            angle=math.atan2(delta.y,delta.x)
+            cx_orb=attractor.pos.x-ecc*a*math.cos(angle)
+            cy_orb=attractor.pos.y-ecc*a*math.sin(angle)
+        except Exception:
+            return
+        step_deg = 8 if performance_mode else 4
+        world_pts=[]
+        for deg in range(0,360,step_deg):
+            t=math.radians(deg)
+            ex=cx_orb+a*math.cos(t)*math.cos(angle)-b_axis*math.sin(t)*math.sin(angle)
+            ey=cy_orb+a*math.cos(t)*math.sin(angle)+b_axis*math.sin(t)*math.cos(angle)
+            world_pts.append((ex,ey))
+        if len(orbit_cache) > 180:
+            orbit_cache.clear()
+        orbit_cache[cache_key] = world_pts
 
     pts=[]
-    for point in world_pts:
-        sx2,sy2=world_to_screen(point,camera_offset,zoom,cx,cy)
+    for ex,ey in world_pts:
+        sx2,sy2=world_to_screen(pygame.Vector2(ex,ey),camera_offset,zoom,cx,cy)
         if -3000<=sx2<=SIM_W+3000 and -3000<=sy2<=HEIGHT+3000:
             pts.append((sx2,sy2))
     if len(pts)>2:
         s=pygame.Surface((SIM_W,HEIGHT),pygame.SRCALPHA)
-        alpha = 28 if performance_mode else 48
-        pygame.draw.lines(s,(*body.color[:3],alpha),False,pts,1)
+        alpha = 28 if performance_mode else 42
+        pygame.draw.lines(s,(*body.color[:3],alpha),True,pts,1)
         screen.blit(s,(0,0))
 
 def get_body_at(mx,my):
@@ -733,6 +763,88 @@ def draw_planet_texture(body, sx, sy, r):
         s.blit(mask,(0,0),special_flags=pygame.BLEND_RGBA_MULT)
         _texture_cache[ckey]=s
     screen.blit(_texture_cache[ckey],(sx-r-1,sy-r-1))
+
+
+
+def draw_surface_marks(body, sx, sy, r):
+    """Patch 30: desenha crateras/cicatrizes simples presas ao corpo."""
+    marks = getattr(body, "surface_marks", [])
+    if not marks or r < 4:
+        return
+    for mark in marks[-12:]:
+        angle = mark.get("angle", 0.0) + getattr(body, "rotation", 0.0) * 0.15
+        severity = max(0.05, min(1.0, mark.get("severity", 0.2)))
+        mx = int(sx + math.cos(angle) * r * 0.52)
+        my = int(sy + math.sin(angle) * r * 0.52)
+        if mark.get("type") == "cicatriz":
+            length = max(4, int(r * mark.get("length", 0.4)))
+            width = max(1, int(r * mark.get("width", 0.08)))
+            scar = pygame.Surface((length + 6, width * 4 + 6), pygame.SRCALPHA)
+            col = (35, 22, 18, int(95 + severity * 90))
+            hot = (255, 120, 45, int(30 + severity * 70))
+            pygame.draw.ellipse(scar, col, (3, 3, length, width * 3))
+            pygame.draw.line(scar, hot, (4, width * 2), (length, width * 2), max(1, width))
+            rot = pygame.transform.rotate(scar, -math.degrees(angle))
+            screen.blit(rot, (mx - rot.get_width() // 2, my - rot.get_height() // 2))
+        else:
+            cr = max(2, int(r * mark.get("width", 0.1) * (0.8 + severity)))
+            pygame.draw.circle(screen, (28, 22, 18), (mx, my), cr)
+            pygame.draw.circle(screen, (95, 65, 45), (mx, my), cr, 1)
+            if severity > 0.35:
+                pygame.draw.circle(screen, (255, 115, 45), (mx, my), max(1, cr // 3), 1)
+
+    # Patch 31: mostra pontos quentes/dano vindos da grade de superficie local.
+    surface_grid = getattr(body, "surface_grid", [])
+    if surface_grid and r >= 7:
+        rot = getattr(body, "rotation", 0.0) * 0.15
+        step = max(1, len(surface_grid) // 18)
+        for cell in surface_grid[::step]:
+            temp = cell.get("temperature", 300.0)
+            damage = cell.get("damage", 0.0)
+            melt = cell.get("melt", 0.0)
+            intensity = max(damage, min(1.0, (temp - 650.0) / 5200.0), melt)
+            if intensity <= 0.04:
+                continue
+            angle = cell.get("angle", 0.0) + rot
+            px = int(sx + math.cos(angle) * r * 0.58)
+            py = int(sy + math.sin(angle) * r * 0.58)
+            pr = max(1, int(r * (0.025 + 0.045 * intensity)))
+            color = (255, 120, 35) if temp > 1200 else (85, 55, 40)
+            alpha = int(35 + intensity * 120)
+            dot = pygame.Surface((pr * 4 + 4, pr * 4 + 4), pygame.SRCALPHA)
+            pygame.draw.circle(dot, (*color, alpha), (pr * 2 + 2, pr * 2 + 2), pr * 2)
+            screen.blit(dot, (px - pr * 2 - 2, py - pr * 2 - 2))
+
+    heat_points = getattr(body, "local_heat_points", [])
+    for hp in heat_points[-8:]:
+        angle = hp.get("angle", 0.0)
+        hx = int(sx + math.cos(angle) * r * 0.54)
+        hy = int(sy + math.sin(angle) * r * 0.54)
+        intensity = max(0.0, min(1.0, (hp.get("temperature", 300.0) - 600.0) / 4500.0))
+        if intensity <= 0.02:
+            continue
+        hr = max(1, int(r * hp.get("radius", 0.08) * (0.7 + intensity)))
+        glow = pygame.Surface((hr * 4 + 4, hr * 4 + 4), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (255, 120, 35, int(30 + intensity * 90)), (hr * 2 + 2, hr * 2 + 2), hr * 2)
+        screen.blit(glow, (hx - hr * 2 - 2, hy - hr * 2 - 2))
+
+
+def draw_irregular_fragment(body, sx, sy, r):
+    pts = getattr(body, "irregular_points", [])
+    if not pts or r < 2:
+        return False
+    rot = getattr(body, "rotation", 0.0)
+    cosr, sinr = math.cos(rot), math.sin(rot)
+    poly = []
+    for x, y in pts:
+        rx = x * cosr - y * sinr
+        ry = x * sinr + y * cosr
+        poly.append((int(sx + rx * r), int(sy + ry * r)))
+    if len(poly) >= 3:
+        pygame.draw.polygon(screen, body.color, poly)
+        pygame.draw.polygon(screen, tuple(max(0, c - 55) for c in body.color), poly, 1)
+        return True
+    return False
 
 def draw_body_effects(body,sx,sy,r):
     btype="small"
@@ -878,59 +990,46 @@ def draw_barycenter():
 
 _spawned_events=set()
 def draw_collision_events():
-    # limpar spawned de eventos que já foram removidos
+    """Patch 27: sem aneis/circulos arcade.
+    O evento aparece por calor dos corpos + ejecta fisico; aqui fica so rotulo discreto.
+    """
     active_ids={id(ev) for ev in sim.collision_events}
     for eid in list(_spawned_events):
-        if eid not in active_ids: _spawned_events.discard(eid)
+        if eid not in active_ids:
+            _spawned_events.discard(eid)
     for ev in sim.collision_events:
         eid=id(ev)
         if eid not in _spawned_events:
-            # Reduz partículas quando há muitos corpos para evitar queda forte de FPS.
-            if len(sim.bodies) > 180:
-                _pc = 12
-            elif ev.kind in ("nova", "blackhole"):
-                _pc = 36
-            else:
-                _pc = 22
+            # Poucas particulas visuais, apenas para sugerir ejecta; sem onda circular.
+            _pc = 6 if len(sim.bodies) > 140 else 10
             spawn_collision_particles(ev.pos, ev.kind, _pc)
             _spawned_events.add(eid)
         sx,sy=world_to_screen(ev.pos,camera_offset,zoom,cx,cy)
-        color=COLLISION_COLORS.get(ev.kind,(255,255,255))
-        progress=1.0-(ev.timer/0.4); radius=int(40*progress); fade=int(255*(1.0-progress))
-        if radius>0:
-            if ev.kind=="nova":
-                # onda de choque externa
-                pygame.draw.circle(screen,(255,200,80),(sx,sy),radius,2)
-                pygame.draw.circle(screen,(255,120,40),(sx,sy),max(1,int(radius*0.65)),1)
-                # núcleo brilhante
-                if radius>6:
-                    ns=pygame.Surface((radius,radius),pygame.SRCALPHA)
-                    _na=max(0,min(255,int(80*(1-progress))))
-                    pygame.draw.circle(ns,(255,255,200,_na),(radius//2,radius//2),max(1,radius//2))
-                    screen.blit(ns,(sx-radius//2,sy-radius//2))
-                # nebulosa residual (anel externo esmaecendo)
-                if progress>0.5:
-                    nr=int(radius*1.6)
-                    nt=pygame.Surface((nr*2+4,nr*2+4),pygame.SRCALPHA)
-                    _na1=max(0,min(255,int(30*(1-progress))))
-                    _na2=max(0,min(255,int(60*(1-progress))))
-                    pygame.draw.circle(nt,(180,80,200,_na1),(nr+2,nr+2),nr)
-                    pygame.draw.circle(nt,(200,100,255,_na2),(nr+2,nr+2),nr,2)
-                    screen.blit(nt,(sx-nr-2,sy-nr-2))
-            elif ev.kind=="blackhole":
-                pygame.draw.circle(screen,(100,0,160),(sx,sy),radius,2)
-                pygame.draw.circle(screen,(180,60,255),(sx,sy),max(1,radius//3),1)
-                if radius>4:
-                    bs=pygame.Surface((radius*2,radius*2),pygame.SRCALPHA)
-                    _ba=max(0,min(255,int(60*(1-progress))))
-                    pygame.draw.circle(bs,(60,0,120,_ba),(radius,radius),radius)
-                    screen.blit(bs,(sx-radius,sy-radius))
-            else:
-                pygame.draw.circle(screen,color,(sx,sy),radius,1)
-        lm={"merge":"FUSÃO","nova":"SUPERNOVA!","blackhole":"BURACO NEGRO!","absorb":"ABSORVIDO"}
-        surf=font_small.render(lm.get(ev.kind,""),True,color)
-        surf.set_alpha(fade)
-        screen.blit(surf,(sx-surf.get_width()//2,sy-radius-14))
+        fade=int(180 * max(0.0, min(1.0, ev.timer/0.35)))
+        label=getattr(ev, "label", "") or {
+            "impact_settled":"corpo instavel",
+            "merge":"fusao",
+            "absorb":"acrecao",
+            "fragment":"ejecta",
+            "shatter":"ruptura",
+        }.get(ev.kind, "")
+        if label:
+            surf=font_small.render(label.upper(),True,(210,150,90))
+            surf.set_alpha(fade)
+            screen.blit(surf,(sx-surf.get_width()//2,sy-12))
+
+
+def draw_impact_processes():
+    """Mostra discretamente o estado fisico da colisao em andamento."""
+    for proc in getattr(sim, "impact_processes", []):
+        if not hasattr(proc, "center"):
+            continue
+        sx, sy = world_to_screen(proc.center, camera_offset, zoom, cx, cy)
+        if not (-80 <= sx <= SIM_W + 80 and -80 <= sy <= HEIGHT + 80):
+            continue
+        txt = f"impacto: {getattr(proc, 'stage', 'processo')}"
+        surf = font_small.render(txt, True, (230, 180, 110))
+        screen.blit(surf, (sx - surf.get_width()//2, sy - 18))
 
 # ══════════════════════════════════════════
 #  PAINEL LATERAL — LAYOUT FIXO POR ZONAS
@@ -953,7 +1052,7 @@ FIXED_BOTTOM = (2 + ZONE_HEADER_H +
                 2 + ZONE_TIME_H)
 
 LIST_TOP    = ZONE_TITLE_H + ZONE_TABS_H   # 44px
-LIST_BOTTOM = HEIGHT - FIXED_BOTTOM - 18   # margem para dica sem sobrepor AJUSTE
+LIST_BOTTOM = HEIGHT - FIXED_BOTTOM        # espaço disponível para lista
 
 def draw_slider(label,val,mn,mx_v,x,y,w,key):
     slider_rects[key]=pygame.Rect(x,y,w,10)
@@ -997,8 +1096,8 @@ def draw_panel():
     for i,btype in enumerate(bodies_list):
         bx=SIM_W+4; bw=PANEL_W-8; bh=30
         rect=pygame.Rect(bx,y,bw,bh)
-        btn_rects_bodies.append((rect,i))
         if LIST_TOP<=y<=LIST_BOTTOM-bh:
+            btn_rects_bodies.append((rect,i))
             sel=selected_type==(active_tab,i)
             pygame.draw.rect(screen,(36,36,82) if sel else (16,16,36),rect,border_radius=4)
             pygame.draw.rect(screen,(100,100,215) if sel else (32,32,58),rect,1,border_radius=4)
@@ -1037,7 +1136,7 @@ def draw_panel():
     screen.blit(font_title.render("✦ VISÃO",True,(120,140,225)),(SIM_W+8,fy))
     fy+=ZONE_HEADER_H
 
-    # Toggles em grade 2x2 fixos
+    # Toggles principais + modo avançado.
     hw=(PANEL_W-12)//2
     toggle_rects={}
     toggle_defs=[
@@ -1045,11 +1144,15 @@ def draw_panel():
         ("Órbitas","show_orbits",show_orbits),
         ("Z.Habit.","show_hab_zone",show_hab_zone),
         ("Roche","show_roche",show_roche),
-        ("Gráfico","show_graph",show_graph),
         ("Grav.","show_gravity_zone",show_gravity_zone),
-        ("Baric.","show_barycenter",show_barycenter),
-        ("Perf.","performance_mode",performance_mode),
+        ("Avançado","advanced_view",advanced_view),
     ]
+    if advanced_view:
+        toggle_defs.extend([
+            ("Gráfico","show_graph",show_graph),
+            ("Baric.","show_barycenter",show_barycenter),
+            ("Perf.","performance_mode",performance_mode),
+        ])
     for i,(lbl,key,state) in enumerate(toggle_defs):
         col=i%2; row=i//2
         tx=SIM_W+4+col*(hw+4)
@@ -1085,79 +1188,24 @@ def draw_panel():
     pygame.draw.line(screen,(35,35,70),(SIM_W+4,fy),(SIM_W+PANEL_W-4,fy),1)
     fy+=2
     btn_rects_time.clear()
-    time_items = ["pause"] + list(TIME_SCALES)
-    bw2=(PANEL_W-12)//len(time_items)
-    for i,item in enumerate(time_items):
+    bw2=(PANEL_W-12)//4
+    for i,ts in enumerate(TIME_SCALES):
         rx=SIM_W+4+i*(bw2+2)
         rect=pygame.Rect(rx,fy,bw2,ZONE_TIME_H-2)
-        btn_rects_time.append((item, rect))
-        if item == "pause":
-            sel = paused
-            lbl = "▶" if paused else "⏸"
-        else:
-            sel=abs(sim.time_scale-item)<0.01 and not paused
-            lbl=f"{item}x"
+        btn_rects_time.append(rect)
+        sel=abs(sim.time_scale-ts)<0.01
         pygame.draw.rect(screen,(16,52,28) if sel else (14,14,26),rect,border_radius=3)
         pygame.draw.rect(screen,(42,165,65) if sel else (32,32,55),rect,1,border_radius=3)
-        tsurf=font_small.render(lbl,True,(85,230,105) if sel else (95,95,115))
-        screen.blit(tsurf,tsurf.get_rect(center=rect.center))
+        s=font_small.render(f"{ts}x",True,(85,230,105) if sel else (95,95,115))
+        screen.blit(s,s.get_rect(center=rect.center))
 
     # Dica no rodapé
-    entry = get_catalog_entry(selected_type)
-    if entry is not None:
-        bname=entry["name"]
+    if selected_type is not None:
+        tab_i,body_i=selected_type
+        bname=list(BODY_CATALOG.values())[tab_i][body_i]["name"]
         screen.blit(font_small.render(f"[ {bname} ] Arraste →",True,(70,240,105)),(SIM_W+6,LIST_BOTTOM+2))
     elif followed_body and followed_body in sim.bodies:
         screen.blit(font_small.render(f"◎ {followed_body.name}",True,(70,185,245)),(SIM_W+6,LIST_BOTTOM+2))
-
-# ══════════════════════════════════════════
-#  EDITOR ORBITAL
-# ══════════════════════════════════════════
-def nearest_massive_host(body):
-    candidates = [o for o in sim.bodies if o is not body and o.mass > body.mass]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda o: o.mass / max((o.pos - body.pos).length_squared(), 25.0))
-
-
-def circularize_body_orbit(body):
-    host = nearest_massive_host(body)
-    if not host:
-        return False
-    radial = body.pos - host.pos
-    dist = max(radial.length(), host.radius + body.radius + 1.0)
-    if dist <= 1e-6:
-        return False
-    tangent = pygame.Vector2(-radial.y, radial.x)
-    if tangent.length_squared() == 0:
-        tangent = pygame.Vector2(0, 1)
-    tangent = tangent.normalize()
-    current_rel = body.vel - host.vel
-    if current_rel.dot(tangent) < 0:
-        tangent *= -1
-    speed = math.sqrt(G * host.mass / dist)
-    body.vel = host.vel + tangent * speed
-    body.trail = []
-    body.collision_cooldown = 0.8
-    return True
-
-
-def zero_body_velocity(body):
-    host = nearest_massive_host(body)
-    body.vel = pygame.Vector2(host.vel) if host else pygame.Vector2(0, 0)
-    body.trail = []
-    body.collision_cooldown = 0.8
-    return True
-
-
-def move_body_to_world(body, pos):
-    """Reposiciona um corpo com limpeza de rastro e proteção de colisão curta."""
-    if not body or body not in sim.bodies:
-        return False
-    body.pos = pygame.Vector2(pos)
-    body.trail = []
-    body.collision_cooldown = 0.8
-    return True
 
 # ══════════════════════════════════════════
 #  INFO HUD (lado esquerdo)
@@ -1179,71 +1227,53 @@ def dominant_gravity_source(body):
 def draw_body_info():
     if not selected_body or selected_body not in sim.bodies: return
     b    = selected_body
-    temp_k = body_temperature(b)
-    report = habitability_report(b, sim.bodies, HAB_SCALE)
-    life = report["score"]
+    temp = body_temperature(b)
+    life = life_probability(b)
     bts  = body_type_str(b)
     spd  = b.vel.length()
     lum  = get_luminosity(b)
-    ws,wc= water_state(temp_k)
+    ws,wc= water_state(temp)
     r_in,r_out=hab_zone_radii(b)
     rl   = roche_limit(b)
     atm  = getattr(b,'atmosphere',0)
     wtr  = getattr(b,'water',0)
-    pressure = getattr(b, 'surface_pressure', atm)
     dom_body, dom_acc = dominant_gravity_source(b)
 
-    temp_c = kelvin_to_celsius(temp_k)
-    if temp_c < -80:      tc=(120,160,255)
-    elif temp_c < 0:      tc=(100,190,255)
-    elif temp_c < 60:     tc=(90,230,120)
-    elif temp_c < 500:    tc=(255,190,80)
-    elif temp_c < 3000:   tc=(255,120,60)
-    else:                 tc=(220,180,255)
+    if temp<500:      tc=(100,120,220)
+    elif temp<2000:   tc=(200,120,60)
+    elif temp<6000:   tc=(255,220,100)
+    elif temp<20000:  tc=(180,210,255)
+    else:             tc=(220,180,255)
 
     lines=[
         (f"  {b.name}",                     (255,215,80),  True),
-        (f"Tipo: {bts}",                    (185,185,210), False),
-        (f"Massa: {fmt_mass(b.mass)}",      (185,185,195), False),
-        (f"Raio visual: {fmt_num_br(b.radius,1)} un", (185,185,195), False),
-        (f"Veloc.: {fmt_speed(spd, HAB_SCALE)}", (185,185,195), False),
-        (f"Temp.: {fmt_temp_c(temp_k)}",     tc,            False),
-        (f"Água: {ws}  {fmt_num_br(wtr*100,0)}%", wc,       False),
-        (f"Atmosfera: {fmt_num_br(atm,2)} bar",  (140,180,220), False),
-        (f"Pressão: {fmt_num_br(pressure,2)} bar", (140,180,220), False),
+        (f"Tipo:   {bts}",                  (185,185,210), False),
+        (f"Massa:  {b.mass:.2e}",           (185,185,195), False),
+        (f"Vel:    {spd:.1f} u/s",          (185,185,195), False),
+        (f"Temp:   ~{temp} K",              tc,            False),
+        (f"Água:   {ws}",                   wc,            False),
+        (f"Atm:    {atm:.2f} bar",          (140,180,220), False),
     ]
     if dom_body:
-        dist = (b.pos - dom_body.pos).length()
-        lines.append((f"Gravidade dom.: {dom_body.name[:12]}", (150,170,240), False))
-        lines.append((f"Dist.: {fmt_distance_au(dist, HAB_SCALE)}", (150,170,240), False))
-        lines.append((f"Acel.g: {fmt_acceleration(dom_acc, HAB_SCALE)}", (120,140,210), False))
-    if getattr(b, "tidal_heat", 0.0) > 1.0:
-        lines.append((f"Aquec. maré: {fmt_num_br(getattr(b,'tidal_heat',0.0),1)}", (230,120,80), False))
-    if getattr(b, "roche_stress", 0.0) > 0.01:
-        lines.append((f"Stress Roche: {fmt_num_br(getattr(b,'roche_stress',0.0)*100,0)}%", (255,85,85), False))
-    if getattr(b, "ice_fraction", 0.0) > 0.05:
-        lines.append((f"Gelo sup.: {fmt_num_br(getattr(b,'ice_fraction',0.0)*100,0)}%", (150,210,255), False))
-    if getattr(b, "water_vapor", 0.0) > 0.05:
-        lines.append((f"Vapor água: {fmt_num_br(getattr(b,'water_vapor',0.0)*100,0)}%", (190,210,255), False))
+        lines.append((f"Grav.dom: {dom_body.name[:14]}", (150,170,240), False))
+        lines.append((f"Acel.g: {dom_acc:.2e}", (120,140,210), False))
     if lum>0:
-        lines.append((f"Luminos.: {fmt_num_br(lum,2)} L☉",(255,225,95),False))
+        lines.append((f"Lumin.: {lum:.2e} L☉",(255,225,95),False))
     if r_in:
-        lines.append((f"Zona habit.: {fmt_distance_au(r_in,HAB_SCALE)}-{fmt_distance_au(r_out,HAB_SCALE)}",(70,240,105),False))
+        lines.append((f"Z.Hab:  {int(r_in)}-{int(r_out)} u",(70,240,105),False))
     if rl:
-        lines.append((f"Roche: {fmt_distance_au(rl,HAB_SCALE)}",(240,85,85),False))
-
-    life_color = (70,240,105) if life >= 35 else (220,180,80) if life >= 8 else (120,120,140)
-    lines.append((f"Vida estimada: {fmt_num_br(life,1)}% ({report['class']})", life_color, False))
-    factor_items = list(report.get('factors', {}).items())
-    if report.get('reasons'):
-        lines.append(("Limites: " + ", ".join(report['reasons'])[:30], (190,150,90), False))
+        lines.append((f"Roche:  {int(rl)} u",(240,85,85),False))
+    if life>0:
+        lines.append((f"🌱 Vida: {life}%",(70,240,105),False))
+    else:
+        lines.append(("Vida: improvável",(85,85,105),False))
     lines.append((f"Pos: ({int(b.pos.x)}, {int(b.pos.y)})",(110,110,130),False))
 
-    h_box=len(lines)*15+76 + min(6, len(factor_items))*16
+    h_box=len(lines)*15+36
     x0=10; y0_box=HEIGHT-h_box-30
-    bg=pygame.Surface((252,h_box+8),pygame.SRCALPHA)
-    pygame.draw.rect(bg,(5,8,22,230),(0,0,252,h_box+8),border_radius=10)
-    pygame.draw.rect(bg,(60,80,160,180),(0,0,252,h_box+8),1,border_radius=8)
+    bg=pygame.Surface((235,h_box+8),pygame.SRCALPHA)
+    pygame.draw.rect(bg,(5,8,22,230),(0,0,235,h_box+8),border_radius=10)
+    pygame.draw.rect(bg,(60,80,160,180),(0,0,235,h_box+8),1,border_radius=8)
     screen.blit(bg,(x0-4,y0_box-4))
 
     y0=y0_box
@@ -1252,45 +1282,29 @@ def draw_body_info():
         screen.blit(f.render(line,True,color),(x0,y0))
         y0+=15
 
+    # Barra de vida
     if life>0:
-        pygame.draw.rect(screen,(18,38,22),(x0,y0-2,110,5),border_radius=2)
-        pygame.draw.rect(screen,(55,205,75),(x0,y0-2,int(life/100*110),5),border_radius=2)
-
-    y0 += 12
-    if factor_items:
-        screen.blit(font_small.render("Adequação para vida", True, (165, 175, 205)), (x0, y0 - 4))
-        y0 += 14
-    for key, val in factor_items[:6]:
-        draw_factor_bar(screen, font_small, x0, y0, 135, key, val)
-        y0 += 16
+        pygame.draw.rect(screen,(18,38,22),(x0,y0-2,90,5),border_radius=2)
+        pygame.draw.rect(screen,(55,205,75),(x0,y0-2,int(life/100*90),5),border_radius=2)
 
     y0+=6
     is_f=followed_body==b
-    fr=pygame.Rect(x0,y0,76,18)
-    er=pygame.Rect(x0+80,y0,80,18)
-    mr=pygame.Rect(x0+164,y0,76,18)
-    zv=pygame.Rect(x0,y0+22,76,18)
-    cv=pygame.Rect(x0+80,y0+22,92,18)
-    tr=pygame.Rect(x0,y0+44,108,18)
+    fr=pygame.Rect(x0,y0,108,18)
+    er=pygame.Rect(x0+112,y0,108,18)
+    tr=pygame.Rect(x0,y0+22,108,18)
     pygame.draw.rect(screen,(16,46,65) if is_f else (14,14,28),fr,border_radius=4)
     pygame.draw.rect(screen,(50,145,205) if is_f else (36,36,60),fr,1,border_radius=4)
-    screen.blit(font_small.render("Seguindo" if is_f else "Seguir",True,(70,190,245) if is_f else (95,95,115)),(x0+5,y0+3))
+    screen.blit(font_small.render("◎ Seguindo" if is_f else "◎ Seguir",True,(70,190,245) if is_f else (95,95,115)),(x0+5,y0+3))
     pygame.draw.rect(screen,(36,26,16) if editing_name else (14,14,28),er,border_radius=4)
     pygame.draw.rect(screen,(165,125,50) if editing_name else (36,36,60),er,1,border_radius=4)
-    screen.blit(font_small.render("Renomear",True,(210,170,70) if editing_name else (95,95,115)),(x0+85,y0+3))
-    pygame.draw.rect(screen,(18,44,46) if moving_body is b else (14,14,28),mr,border_radius=4)
-    pygame.draw.rect(screen,(60,185,190) if moving_body is b else (36,36,60),mr,1,border_radius=4)
-    screen.blit(font_small.render("Setas",True,(90,220,220) if moving_body is b else (95,95,115)),(mr.x+8,y0+3))
-    pygame.draw.rect(screen,(42,20,20),zv,border_radius=4)
-    pygame.draw.rect(screen,(145,70,70),zv,1,border_radius=4)
-    screen.blit(font_small.render("Zerar V",True,(225,145,145)),(zv.x+5,zv.y+3))
-    pygame.draw.rect(screen,(22,32,54),cv,border_radius=4)
-    pygame.draw.rect(screen,(75,105,190),cv,1,border_radius=4)
-    screen.blit(font_small.render("Circularizar",True,(135,165,240)),(cv.x+5,cv.y+3))
+    screen.blit(font_small.render("✎ Renomear",True,(210,170,70) if editing_name else (95,95,115)),(x0+117,y0+3))
+    # Botão Terraformar
     pygame.draw.rect(screen,(16,40,22),tr,border_radius=4)
     pygame.draw.rect(screen,(40,140,60),tr,1,border_radius=4)
-    screen.blit(font_small.render("Terraformar",True,(70,200,90)),(x0+3,y0+47))
-    return fr, er, tr, mr, zv, cv
+    screen.blit(font_small.render("🌿 Terraformar",True,(70,200,90)),(x0+3,y0+25))
+
+    # Clique área botões info
+    return fr, er, tr
 
 # ══════════════════════════════════════════
 #  EVOLUÇÃO ESTELAR
@@ -1361,10 +1375,9 @@ _frame_count = 0
 #  LOOP PRINCIPAL
 # ══════════════════════════════════════════
 graph_update_timer = 0.0
-info_fr=info_er=info_tr=info_mr=info_zv=info_cv=None
+info_fr=info_er=info_tr=None
 
 while running:
-    validate_selected_type()
     dt=clock.tick(FPS)/1000.0
     twinkle_time+=dt
     sim.performance_mode = performance_mode
@@ -1418,8 +1431,7 @@ while running:
                 camera_offset=pygame.Vector2(0,0); zoom=zoom_target=1.0; followed_body=None
             if event.key==pygame.K_u:
                 if selected_body and selected_body in sim.bodies and selected_body.mass>=5e2:
-                    # Órbita inicial fora do Roche visual. A distância antiga era curta demais e a lua nascia triturada.
-                    _orb_r=max(selected_body.radius*8.0, selected_body.radius+18.0)
+                    _orb_r=selected_body.radius*3.5
                     _angle=random.uniform(0,math.pi*2)
                     _lx=selected_body.pos.x+math.cos(_angle)*_orb_r
                     _ly=selected_body.pos.y+math.sin(_angle)*_orb_r
@@ -1432,8 +1444,7 @@ while running:
                              (200,200,190),f"Lua de {selected_body.name}")
                     _moon.atmosphere=0.0; _moon.water=0.0
                     _moon.born_timer=0.0
-                    _moon.collision_cooldown=0.6
-                    sim.add_body(_moon)
+            sim.add_body(_moon)
             if event.key==pygame.K_ESCAPE:
                 if terraforming_body:
                     terraforming_body=None
@@ -1445,26 +1456,10 @@ while running:
                     selected_type=None
                     selected_body=None
                     followed_body=None
-                    moving_body=None
-                    body_dragging=False
-            # Setas: movem o corpo selecionado quando o modo Setas está ativo.
-            # Fora dele, setas navegam pela câmera na direção intuitiva.
-            if event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
-                step = (90.0 if (pygame.key.get_mods() & pygame.KMOD_SHIFT) else 25.0) / zoom
-                if moving_body and moving_body in sim.bodies:
-                    if event.key == pygame.K_UP:    moving_body.pos.y -= step
-                    if event.key == pygame.K_DOWN:  moving_body.pos.y += step
-                    if event.key == pygame.K_LEFT:  moving_body.pos.x -= step
-                    if event.key == pygame.K_RIGHT: moving_body.pos.x += step
-                    moving_body.trail = []
-                    moving_body.collision_cooldown = 0.8
-                    selected_body = moving_body
-                    followed_body = None
-                else:
-                    if event.key == pygame.K_UP:    camera_offset.y += step
-                    if event.key == pygame.K_DOWN:  camera_offset.y -= step
-                    if event.key == pygame.K_LEFT:  camera_offset.x += step
-                    if event.key == pygame.K_RIGHT: camera_offset.x -= step
+            if event.key==pygame.K_w: camera_offset.y+=20/zoom
+            if event.key==pygame.K_s: camera_offset.y-=20/zoom
+            if event.key==pygame.K_a: camera_offset.x+=20/zoom
+            if event.key==pygame.K_d: camera_offset.x-=20/zoom
             # trocar modo gráfico
             if event.key==pygame.K_TAB and show_graph:
                 gi=graph_modes.index(graph_mode)
@@ -1477,10 +1472,6 @@ while running:
                     graph_history.pop(id(selected_body), None)
                     sim.bodies.remove(selected_body)
                     if followed_body == selected_body: followed_body = None
-                    if moving_body == selected_body: moving_body = None
-                    if body_drag_target == selected_body:
-                        body_drag_target = None
-                        body_dragging = False
                     selected_body = None
 
             if event.key == pygame.K_d and pygame.key.get_mods() & pygame.KMOD_CTRL:
@@ -1537,9 +1528,9 @@ while running:
                     else:
                         rect,step,mn,mx_v=val
                         if rect.collidepoint(mx,my):
-                            _key_map={"atm":"atmosphere","water":"water","co2":"co2","n2":"n2","o2":"o2","ch4":"ch4","albedo":"albedo"}
+                            _key_map={"atm":"atmosphere","water":"water","co2":"co2","n2":"n2","albedo":"albedo"}
                             attr=_key_map.get(key.replace("_up","").replace("_dn",""),key.replace("_up","").replace("_dn",""))
-                            _defaults={"atmosphere":0.0,"water":0.0,"co2":0.0,"n2":0.0,"o2":0.0,"ch4":0.0,"albedo":0.3}
+                            _defaults={"atmosphere":0.0,"water":0.0,"co2":0.0,"n2":0.0,"albedo":0.3}
                             if not hasattr(terraforming_body,attr):
                                 setattr(terraforming_body,attr,_defaults.get(attr,0.0))
                             cur=getattr(terraforming_body,attr,_defaults.get(attr,0.0))
@@ -1574,6 +1565,7 @@ while running:
                         elif var=="show_minimap":    show_minimap=not show_minimap
                         elif var=="show_graph":      show_graph=not show_graph
                         elif var=="show_gravity_zone": show_gravity_zone=not show_gravity_zone
+                        elif var=="advanced_view":     advanced_view=not advanced_view
                         elif var=="show_barycenter":   show_barycenter=not show_barycenter
                         elif var=="performance_mode":
                             performance_mode=not performance_mode
@@ -1589,25 +1581,11 @@ while running:
                 for rect,i in btn_rects_bodies:
                     if rect.collidepoint(mx,my):
                         key=(active_tab,i)
-                        entry=get_catalog_entry(key)
-                        if entry and entry.get("preset"):
-                            if apply_preset(sim, entry["preset"]):
-                                selected_type=None; selected_body=None; followed_body=None; moving_body=None; body_dragging=False; body_drag_target=None
-                                body_ages.clear(); flare_timers.clear(); graph_history.clear(); orbit_cache.clear(); preview_trail=[]
-                                planet_count=len(sim.bodies)
-                                paused=False
-                        else:
-                            selected_type=key if selected_type!=key else None
-                            selected_body=None; preview_trail=[]
+                        selected_type=key if selected_type!=key else None
+                        selected_body=None; preview_trail=[]
 
-                for item, rect in btn_rects_time:
-                    if rect.collidepoint(mx,my):
-                        if item == "pause":
-                            paused = not paused
-                        else:
-                            sim.time_scale = item
-                            paused = False
-                        orbit_cache.clear()
+                for i,rect in enumerate(btn_rects_time):
+                    if rect.collidepoint(mx,my): sim.time_scale=TIME_SCALES[i]
 
             elif mx<SIM_W:
                 # Cliques nos botões do info HUD
@@ -1615,17 +1593,6 @@ while running:
                     followed_body=None if followed_body==selected_body else selected_body
                 elif info_er and info_er.collidepoint(mx,my):
                     editing_name=True; edit_text=selected_body.name if selected_body else ""
-                elif info_mr and info_mr.collidepoint(mx,my):
-                    moving_body = None if moving_body is selected_body else selected_body
-                    if moving_body:
-                        followed_body = None
-                        paused = True
-                elif info_zv and info_zv.collidepoint(mx,my):
-                    if selected_body and selected_body in sim.bodies:
-                        zero_body_velocity(selected_body)
-                elif info_cv and info_cv.collidepoint(mx,my):
-                    if selected_body and selected_body in sim.bodies:
-                        circularize_body_orbit(selected_body)
                 elif info_tr and info_tr.collidepoint(mx,my):
                     terraforming_body=selected_body
 
@@ -1639,22 +1606,13 @@ while running:
                             globals()["graph_mode"]=gm; break
 
                 elif event.button==1:
-                    hit = get_body_at(mx,my)
-                    if hit and hit is selected_body and get_catalog_entry(selected_type) is None:
-                        # Clique e segure no corpo já selecionado: arrasta apenas enquanto o botão estiver pressionado.
-                        body_drag_target = hit
-                        body_dragging = True
-                        followed_body = None
-                        paused = True
-                        world_pos = screen_to_world(mx, my, camera_offset, zoom, cx, cy)
-                        body_drag_offset = hit.pos - world_pos
-                        hit.collision_cooldown = 0.8
-                    elif get_catalog_entry(selected_type) is not None and sim.can_add_body():
+                    if selected_type is not None and sim.can_add_body():
                         placing=True
                         place_start_screen=pygame.Vector2(mx,my)
                         place_pos_world=screen_to_world(mx,my,camera_offset,zoom,cx,cy)
                         preview_trail=[]
                     else:
+                        hit=get_body_at(mx,my)
                         if hit and hit==last_click_body and (now-last_click_time)<400:
                             followed_body=hit
                         else:
@@ -1670,10 +1628,6 @@ while running:
                         graph_history.pop(id(hit),None)
                         sim.bodies.remove(hit)
                         if selected_body==hit: selected_body=None
-                        if moving_body==hit: moving_body=None
-                        if body_drag_target==hit:
-                            body_drag_target=None
-                            body_dragging=False
                         if terraforming_body==hit: terraforming_body=None
                     else:
                         dragging=True; drag_start=pygame.Vector2(mx,my)
@@ -1681,13 +1635,11 @@ while running:
         if event.type==pygame.MOUSEBUTTONUP:
             if event.button==1:
                 if dragging_slider: dragging_slider=None
-                body_dragging = False
-                body_drag_target = None
-                body_drag_offset = pygame.Vector2(0, 0)
                 if placing:
                     placing=False; mx,my=pygame.mouse.get_pos()
-                    if get_catalog_entry(selected_type) is not None and place_pos_world is not None:
-                        btype=get_catalog_entry(selected_type)
+                    if selected_type is not None and place_pos_world is not None:
+                        tab_i,body_i=selected_type
+                        btype=list(BODY_CATALOG.values())[tab_i][body_i]
                         drag_vec=pygame.Vector2(mx,my)-place_start_screen
                         launch_vel=-drag_vec*(3.0/zoom)*slider_vel_mult
                         planet_count+=1
@@ -1717,24 +1669,17 @@ while running:
                 if dragging_slider=="mass":  slider_mass_mult=nv
                 elif dragging_slider=="rad": slider_rad_mult=nv
                 elif dragging_slider=="vel": slider_vel_mult=nv
-            if body_dragging and body_drag_target and body_drag_target in sim.bodies and mx < SIM_W and pygame.mouse.get_pressed()[0]:
-                new_pos = screen_to_world(mx, my, camera_offset, zoom, cx, cy) + body_drag_offset
-                move_body_to_world(body_drag_target, new_pos)
-                selected_body = body_drag_target
-            elif body_dragging and not pygame.mouse.get_pressed()[0]:
-                body_dragging = False
-                body_drag_target = None
-                body_drag_offset = pygame.Vector2(0, 0)
             if dragging and not dragging_slider:
                 mp=pygame.Vector2(mx,my)
                 delta=(mp-drag_start)/zoom
                 camera_offset+=delta
                 cam_velocity=delta*FPS
                 drag_start=mp; followed_body=None
-            if placing and place_pos_world is not None and get_catalog_entry(selected_type) is not None:
+            if placing and place_pos_world is not None and selected_type is not None:
                 drag_vec=pygame.Vector2(mx,my)-place_start_screen
                 launch_vel=-drag_vec*(3.0/zoom)*slider_vel_mult
-                btype=get_catalog_entry(selected_type)
+                tab_i,body_i=selected_type
+                btype=list(BODY_CATALOG.values())[tab_i][body_i]
                 if performance_mode and len(sim.bodies) > 90:
                     preview_trail=[]
                 else:
@@ -1748,7 +1693,6 @@ while running:
     # ── ATUALIZAÇÃO ──
     if not paused:
         sim.step(dt)  # colisões já são verificadas internamente com sub-steps
-        update_environment(sim.bodies, dt, sim.time_scale, HAB_SCALE)
         sim.check_roche()
         update_stellar_evolution(dt)
         update_atmosphere_loss(dt)
@@ -1792,8 +1736,9 @@ while running:
                 pygame.draw.line(screen,_tc,_tpts[_ti],_tpts[min(_ti+_step,_ttotal-1)],1)
 
     # Preview de trajetória
-    if preview_trail and len(preview_trail)>1 and get_catalog_entry(selected_type) is not None:
-        color_p=get_catalog_entry(selected_type)["color"]
+    if preview_trail and len(preview_trail)>1 and selected_type is not None:
+        tab_i,body_i=selected_type
+        color_p=list(BODY_CATALOG.values())[tab_i][body_i]["color"]
         points=[]
         for point in preview_trail:
             sx=int((point.x+camera_offset.x)*zoom+SIM_W/2-cx*zoom)
@@ -1813,8 +1758,10 @@ while running:
             if show_vectors:
                 draw_velocity_vector(body,sx,sy,r)
                 draw_acceleration_vector(body,sx,sy,r)
-            draw_selection_rings(screen, sx, sy, r, body==selected_body, body==followed_body)
-            draw_temperature_badge(screen, sx, sy, r, body)
+            if body==selected_body:
+                pygame.draw.circle(screen,(255,255,70),(sx,sy),r+5,1)
+            if body==followed_body:
+                pygame.draw.circle(screen,(50,170,255),(sx,sy),r+8,1)
             # glow estrelar — discreto e proporcional
             _lum=get_luminosity(body)
             if _lum>0 and r>=3:
@@ -1824,7 +1771,9 @@ while running:
                     pygame.draw.circle(_gs,(*body.color,_ga2),(_gr+1,_gr+1),_gr)
                     screen.blit(_gs,(sx-_gr-1,sy-_gr-1))
             # corpo principal
-            draw_planet_texture(body,sx,sy,r)
+            if not (getattr(body, "is_fragment", False) and draw_irregular_fragment(body, sx, sy, r)):
+                draw_planet_texture(body,sx,sy,r)
+            draw_surface_marks(body, sx, sy, r)
             # sombra 3D (semicírculo escuro no lado oposto à estrela mais próxima)
             if r>=4 and _lum==0:
                 _dark=pygame.Surface((r*2,r*2),pygame.SRCALPHA)
@@ -1869,8 +1818,9 @@ while running:
     # Seta de lançamento
     if placing and place_start_screen is not None:
         mx,my=pygame.mouse.get_pos()
-        if mx<SIM_W and get_catalog_entry(selected_type) is not None:
-            btype=get_catalog_entry(selected_type)
+        if mx<SIM_W:
+            tab_i,body_i=selected_type
+            btype=list(BODY_CATALOG.values())[tab_i][body_i]
             psx=int((place_pos_world.x+camera_offset.x)*zoom+SIM_W/2-cx*zoom)
             psy=int((place_pos_world.y+camera_offset.y)*zoom+HEIGHT/2-cy*zoom)
             pygame.draw.circle(screen,btype["color"],(psx,psy),max(2,int(btype["radius"]*slider_rad_mult*zoom)),1)
@@ -1883,10 +1833,11 @@ while running:
     update_collision_particles(dt)
     draw_collision_particles()
     draw_collision_events()
+    draw_impact_processes()
 
     # HUD esquerdo
     result = draw_body_info()
-    if result: info_fr, info_er, info_tr, info_mr, info_zv, info_cv = result
+    if result: info_fr, info_er, info_tr = result
 
     if show_graph: draw_graph()
     if terraforming_body and terraforming_body in sim.bodies:
@@ -1899,13 +1850,10 @@ while running:
         screen.blit(hud_bg,(6,6))
         screen.blit(font.render("⏸ PAUSADO",True,(145,190,255)),(12,10))
 
-    # Status discreto, sem poluir com lista de atalhos.
-    status = f"Corpos: {len(sim.bodies)} | Tempo: {'pausado' if paused else str(sim.time_scale)+'x'}"
-    if body_dragging and body_drag_target and body_drag_target in sim.bodies:
-        status += f" | Arrastando: {body_drag_target.name}"
-    elif moving_body and moving_body in sim.bodies:
-        status += f" | Modo setas: {moving_body.name} | Shift+setas rápido"
-    screen.blit(font_small.render(status, True, (55,55,80)), (10, HEIGHT-12))
+    # Barra de teclas
+    screen.blit(font_small.render(
+        "ESPAÇO pausa | V vetores | O órbitas | H hab. | L Roche | J grav. | B baric. | G gráfico | U lua | X galáxia | F5 salvar | F9 carregar | R resetar câmera | DEL deletar | CTRL+D duplicar | CTRL+R reset sim",
+        True,(55,55,80)),(10,HEIGHT-12))
 
     draw_panel()
     pygame.display.flip()

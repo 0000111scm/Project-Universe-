@@ -95,3 +95,12 @@ STELLAR_EVOLUTION = {
     "Eta Carinae":      {"age_limit":60,  "next":"supernova"},
     "Betelgeuse":       {"age_limit":150, "next":"supernova"},
 }
+
+
+# Escala física realista/comprimida aplicada ao catálogo.
+try:
+    from physics.real_scale import update_catalog_with_real_scales
+except Exception:
+    from real_scale import update_catalog_with_real_scales
+
+update_catalog_with_real_scales(BODY_CATALOG)
