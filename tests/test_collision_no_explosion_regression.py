@@ -1,0 +1,37 @@
+from pathlib import Path
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from simulation import Simulation
+from body import Body
+
+sim = Simulation()
+
+bodies = [
+    Body(470, 400, 150, 0, 1000, 12, (50, 120, 220), "A"),
+    Body(530, 400, -150, 0, 1000, 12, (200, 80, 50), "B"),
+    Body(500, 455, 0, -150, 900, 11, (80, 200, 120), "C"),
+]
+for b in bodies:
+    b.material = "rock"
+    sim.add_body(b)
+
+for _ in range(140):
+    sim.step(0.016)
+    assert len(sim.bodies) <= sim.max_bodies
+
+rock_frags = [b for b in sim.bodies if getattr(b, "is_fragment", False) and getattr(b, "material", "") == "rock"]
+assert len(rock_frags) <= 18, f"fragmentos demais: {len(rock_frags)}"
+
+for f in rock_frags:
+    assert f.radius <= 2.2, f"fragmento gigante: {f.radius}"
+    assert f.vel.length() < 1800, f"detrito rápido demais: {f.vel.length()}"
+
+for b in sim.bodies:
+    assert b.mass > 0
+    assert b.radius > 0
+    assert not (getattr(b, "has_rings", False) and getattr(b, "material", "") == "rock")
+
+print("OK: collision no explosion regression")
